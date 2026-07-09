@@ -36,3 +36,18 @@ def test_gpu_dockerfile_pins_onnxruntime_gpu_matching_cuda_runtime() -> None:
     assert "ARG ONNXRUNTIME_GPU_VERSION=1.27.0" in dockerfile
     assert 'onnxruntime-gpu==${ONNXRUNTIME_GPU_VERSION}' in dockerfile
     assert "libcudart.so.13" in dockerfile
+
+
+def test_gpu_dockerfile_installs_torch_transformers_dependencies() -> None:
+    dockerfile = GPU_DOCKERFILE.read_text(encoding="utf-8")
+
+    assert "download.pytorch.org/whl/cu128" in dockerfile
+    assert "torch torchvision" in dockerfile
+    assert "pip install ." in dockerfile
+
+
+def test_compose_mounts_bria_rmbg_2_model_path() -> None:
+    compose = COMPOSE_FILE.read_text(encoding="utf-8")
+
+    assert "${HOME}/models/briaai/RMBG-2.0:/models/briaai/RMBG-2.0:ro" in compose
+    assert "BRIA_RMBG_2_MODEL_PATH=/models/briaai/RMBG-2.0" in compose
