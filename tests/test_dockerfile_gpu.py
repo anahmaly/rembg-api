@@ -8,6 +8,7 @@ CPU_DOCKERFILE = REPO_ROOT / "Dockerfile.cpu"
 DEFAULT_DOCKERFILE = REPO_ROOT / "Dockerfile"
 GPU_DOCKERFILE = REPO_ROOT / "Dockerfile.gpu"
 COMPOSE_FILE = REPO_ROOT / "compose.yml"
+GPU_COMPOSE_FILE = REPO_ROOT / "compose.gpu.yml"
 
 
 def test_cpu_dockerfile_is_explicit_and_no_default_dockerfile_exists() -> None:
@@ -51,3 +52,16 @@ def test_compose_mounts_bria_rmbg_2_model_path() -> None:
 
     assert "${HOME}/models/briaai/RMBG-2.0:/models/briaai/RMBG-2.0:ro" in compose
     assert "BRIA_RMBG_2_MODEL_PATH=/models/briaai/RMBG-2.0" in compose
+
+
+def test_dedicated_gpu_compose_file_is_explicit_and_convenient() -> None:
+    compose = GPU_COMPOSE_FILE.read_text(encoding="utf-8")
+
+    assert "rembg-api-gpu:" in compose
+    assert "dockerfile: Dockerfile.gpu" in compose
+    assert '"8001:8001"' in compose
+    assert "OMP_NUM_THREADS=1" in compose
+    assert "BRIA_RMBG_2_MODEL_PATH=/models/briaai/RMBG-2.0" in compose
+    assert "${HOME}/models/briaai/RMBG-2.0:/models/briaai/RMBG-2.0:ro" in compose
+    assert "rembg-model-cache:/root/.u2net" in compose
+    assert "gpus: all" in compose

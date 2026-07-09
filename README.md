@@ -75,12 +75,15 @@ The CPU service builds from `Dockerfile.cpu` explicitly and mounts `${HOME}/mode
 docker compose up --build rembg-api
 ```
 
-### GPU compose service
+### Dedicated GPU compose file
 
-The GPU service is behind the `gpu` profile, uses `gpus: all`, and mounts `${HOME}/models/briaai/RMBG-2.0` to `/models/briaai/RMBG-2.0:ro` so you can test BRIA RMBG-2.0 without rebuilding.
+`compose.gpu.yml` is the convenience path for GPU runs. It builds from `Dockerfile.gpu`, requests `gpus: all`, exposes `8001:8001`, mounts the BRIA RMBG-2.0 model read-only from `${HOME}/models/briaai/RMBG-2.0`, and keeps rembg model downloads in the named `rembg-model-cache` volume.
 
 ```bash
-docker compose --profile gpu up --build rembg-api-gpu
+docker compose -f compose.gpu.yml up -d --build
+docker compose -f compose.gpu.yml logs -f
+curl -sS http://localhost:8001/health
+docker compose -f compose.gpu.yml down
 ```
 
 The service listens on <http://localhost:8001> for both CPU and GPU modes.
