@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 from fastapi.testclient import TestClient
@@ -12,6 +13,9 @@ from rembg_api.bria_rmbg import (
     BRIA_RMBG_2_NORMALIZE_STD,
     BRIA_RMBG_2_REQUIRED_MODULES,
     _check_bria_runtime_dependencies,
+    get_torch_status,
+    resolve_bria_backend_cache_key,
+    should_release_cuda_cache_after_request,
     local_model_status,
 )
 
@@ -69,6 +73,31 @@ def test_models_lists_supported_default(monkeypatch) -> None:
     assert body["details"]["bria-rmbg-2.0"]["model_path_available"] is False
 
 
+def test_cache_clear_endpoint_clears_rembg_and_bria_caches(monkeypatch) -> None:
+    calls: dict[str, object] = {}
+
+    def fake_clear_bria_backend_cache(*, release_cuda_cache: bool) -> None:
+        calls["release_cuda_cache"] = release_cuda_cache
+
+    main.get_session.cache_clear()
+    monkeypatch.setattr(main, "new_session", lambda model: f"session:{model}")
+    assert main.get_session("u2net") == "session:u2net"
+    assert main.get_session.cache_info().currsize == 1
+    monkeypatch.setattr(main, "clear_bria_backend_cache", fake_clear_bria_backend_cache)
+
+    client = TestClient(main.app)
+    response = client.post("/cache/clear?release_cuda_cache=false")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ok",
+        "rembg_sessions_cleared": True,
+        "bria_backends_cleared": True,
+    }
+    assert main.get_session.cache_info().currsize == 0
+    assert calls["release_cuda_cache"] is False
+
+
 def test_remove_background_bytes_in_bytes_out(monkeypatch) -> None:
     calls: dict[str, object] = {}
 
@@ -121,10 +150,134 @@ def test_bria_rmbg_routes_to_local_backend_and_returns_png(monkeypatch) -> None:
     assert response.content.startswith(b"\x89PNG")
     kwargs = cast(dict[str, Any], calls["kwargs"])
     assert calls["data"] == make_png()
-    assert kwargs == {"model_input_size": 1024, "device": "auto", "dtype": "auto"}
+    assert kwargs == {
+        "model_input_size": 1024,
+        "device": "auto",
+        "dtype": "auto",
+        "release_cuda_cache": None,
+        "cleanup_after_request": False,
+    }
     with Image.open(BytesIO(response.content)) as image:
         assert image.mode == "RGBA"
         assert image.getpixel((0, 0))[3] == 255
+
+
+def test_bria_release_cuda_cache_query_override(monkeypatch) -> None:
+    calls: dict[str, object] = {}
+
+    def fake_bria_remove(data: bytes, **kwargs) -> bytes:
+        calls["kwargs"] = kwargs
+        return make_png((10, 20, 30, 128), size=(1, 1))
+
+    monkeypatch.setattr(main, "remove_with_bria_rmbg_2", fake_bria_remove)
+    monkeypatch.setattr(
+        main,
+        "release_request_memory",
+        lambda *, release_cuda_cache: calls.setdefault("release_cuda_cache", release_cuda_cache),
+    )
+
+    client = TestClient(main.app)
+    response = client.post(
+        "/remove-background/?model=bria-rmbg-2.0&release_cuda_cache=false",
+        files={"file": ("input.png", make_png(), "image/png")},
+    )
+
+    assert response.status_code == 200
+    kwargs = cast(dict[str, Any], calls["kwargs"])
+    assert kwargs["release_cuda_cache"] is False
+    assert kwargs["cleanup_after_request"] is False
+    assert calls["release_cuda_cache"] is False
+
+
+def test_bria_release_cuda_cache_env_default(monkeypatch) -> None:
+    monkeypatch.delenv("BRIA_RELEASE_CUDA_CACHE_AFTER_REQUEST", raising=False)
+    assert should_release_cuda_cache_after_request() is True
+    monkeypatch.setenv("BRIA_RELEASE_CUDA_CACHE_AFTER_REQUEST", "false")
+    assert should_release_cuda_cache_after_request() is False
+
+
+def test_bria_remove_releases_request_memory_with_env_default(monkeypatch) -> None:
+    from rembg_api import bria_rmbg
+
+    calls: dict[str, object] = {}
+
+    class FakeBackend:
+        def remove_background(self, data: bytes, *, model_input_size: int) -> bytes:
+            calls["data"] = data
+            calls["model_input_size"] = model_input_size
+            return b"png"
+
+    monkeypatch.setenv("BRIA_RELEASE_CUDA_CACHE_AFTER_REQUEST", "false")
+    monkeypatch.setattr(bria_rmbg, "resolve_bria_backend_cache_key", lambda path, device, dtype: (path, "cuda", "fp16"))
+    monkeypatch.setattr(bria_rmbg, "get_bria_rmbg_2_backend", lambda *key: FakeBackend())
+    monkeypatch.setattr(
+        bria_rmbg,
+        "release_request_memory",
+        lambda *, release_cuda_cache: calls.setdefault("release_cuda_cache", release_cuda_cache),
+    )
+
+    assert bria_rmbg.remove_with_bria_rmbg_2(
+        b"input",
+        model_input_size=1024,
+        device="auto",
+        dtype="auto",
+    ) == b"png"
+
+    assert calls == {
+        "data": b"input",
+        "model_input_size": 1024,
+        "release_cuda_cache": False,
+    }
+
+
+def test_bria_cache_key_canonicalizes_auto_to_resolved_cuda(monkeypatch) -> None:
+    class FakeDevice:
+        def __init__(self, value: str) -> None:
+            self.type = value
+
+    fake_torch = SimpleNamespace(
+        float16=object(),
+        float32=object(),
+        cuda=SimpleNamespace(is_available=lambda: True),
+        device=FakeDevice,
+    )
+    monkeypatch.setitem(__import__("sys").modules, "torch", fake_torch)
+
+    assert resolve_bria_backend_cache_key("/models/bria", "auto", "auto") == (
+        "/models/bria",
+        "cuda",
+        "fp16",
+    )
+    assert resolve_bria_backend_cache_key("/models/bria", "cuda", "fp16") == (
+        "/models/bria",
+        "cuda",
+        "fp16",
+    )
+
+
+def test_health_torch_status_includes_cuda_memory_stats(monkeypatch) -> None:
+    fake_cuda = SimpleNamespace(
+        is_available=lambda: True,
+        current_device=lambda: 0,
+        memory_allocated=lambda device: 11,
+        memory_reserved=lambda device: 22,
+        max_memory_allocated=lambda device: 33,
+        max_memory_reserved=lambda device: 44,
+    )
+    fake_torch = SimpleNamespace(__version__="test", cuda=fake_cuda)
+    monkeypatch.setitem(__import__("sys").modules, "torch", fake_torch)
+
+    status = get_torch_status()
+
+    assert status["cuda_available"] is True
+    assert status["cuda_memory"] == {
+        "available": True,
+        "device": 0,
+        "allocated_bytes": 11,
+        "reserved_bytes": 22,
+        "max_allocated_bytes": 33,
+        "max_reserved_bytes": 44,
+    }
 
 
 def test_bria_rmbg_return_alpha_reuses_alpha_post_processing(monkeypatch) -> None:

@@ -8,8 +8,9 @@ Thin FastAPI bytes-in/bytes-out wrapper around [`rembg`](https://github.com/dani
 - The response is PNG bytes (`Content-Type: image/png`).
 - Normal requests do not require temporary filesystem files; input and output are handled as bytes in process.
 - OpenAPI docs are available from FastAPI at `/docs` and `/openapi.json`.
-- `GET /health` reports ONNX Runtime provider availability plus BRIA RMBG-2.0 torch/CUDA and local-path status without downloading weights.
+- `GET /health` reports ONNX Runtime provider availability plus BRIA RMBG-2.0 torch/CUDA, CUDA memory stats, and local-path status without downloading weights.
 - `GET /models` lists supported model IDs and whether the configured BRIA RMBG-2.0 path is present/readable.
+- `POST /cache/clear` clears cached rembg sessions and BRIA RMBG-2.0 backends, then runs Python/CUDA cleanup for LAN-local resource recovery.
 
 ## Run locally
 
@@ -139,7 +140,9 @@ print(ort.get_available_providers())
 PY
 ```
 
-`/health` imports ONNX Runtime and checks torch/local-path availability; it does not create a rembg session, load BRIA RMBG-2.0, or download model weights.
+When torch can see CUDA, `/health` also includes `bria_rmbg_2.cuda_memory` with integer byte counters for `allocated_bytes`, `reserved_bytes`, `max_allocated_bytes`, and `max_reserved_bytes` on the current CUDA device. These fields are best-effort observability and are omitted behind an `available: false` marker if torch/CUDA memory stats are unavailable.
+
+`/health` imports ONNX Runtime and checks torch/local-path/CUDA memory availability; it does not create a rembg session, load BRIA RMBG-2.0, or download model weights.
 
 ## Endpoints
 
@@ -150,6 +153,15 @@ Returns service status plus ONNX Runtime provider observability and BRIA RMBG-2.
 ### `GET /models`
 
 Returns the default model, supported model names, and BRIA RMBG-2.0 configured local-path availability.
+
+### `POST /cache/clear`
+
+Clears cached rembg sessions and BRIA RMBG-2.0 cached backends, runs `gc.collect()`, and calls `torch.cuda.empty_cache()` by default when CUDA is available. The service has no built-in auth, so keep it LAN-local or behind your own trusted network boundary.
+
+```bash
+curl -sS -X POST "http://localhost:8001/cache/clear"
+curl -sS -X POST "http://localhost:8001/cache/clear?release_cuda_cache=false"
+```
 
 ### `POST /remove-background/`
 
@@ -205,10 +217,11 @@ curl -sS -X POST "http://localhost:8001/remove-background/?return_checker_previe
 
 | Parameter | Default | Notes |
 | --- | --- | --- |
-| `model` | `isnet-general-use` | One of `isnet-general-use`, `u2net`, `u2netp`, `isnet-anime`, `silueta`, `bria-rmbg-2.0`. rembg sessions are cached by model; BRIA backend is cached by local path/device/dtype. |
+| `model` | `isnet-general-use` | One of `isnet-general-use`, `u2net`, `u2netp`, `isnet-anime`, `silueta`, `bria-rmbg-2.0`. rembg sessions are cached by model; BRIA backend is cached by canonical local path/device/dtype after resolving `auto`. |
 | `model_input_size` | `1024` | BRIA RMBG-2.0 square input size, `512..2048`. It affects preprocessing only and does not reload the model. |
 | `device` | `auto` | BRIA RMBG-2.0 only: `auto`, `cuda`, or `cpu`. `auto` uses CUDA when torch sees it. |
 | `dtype` | `auto` | BRIA RMBG-2.0 only: `auto`, `fp16`, or `fp32`. `auto` uses fp16 on CUDA and fp32 on CPU. |
+| `release_cuda_cache` | env/default | BRIA RMBG-2.0 only: overrides `BRIA_RELEASE_CUDA_CACHE_AFTER_REQUEST` for this request. When true, the service runs `gc.collect()` and `torch.cuda.empty_cache()` after the request. The env var defaults to `true` when unset. |
 | `only_mask` | `false` | Passed through to `rembg.remove`; ignored for `bria-rmbg-2.0`. |
 | `post_process_mask` | `false` | Passed through to `rembg.remove`; ignored for `bria-rmbg-2.0`. |
 | `alpha_matting` | `false` | Passed through to `rembg.remove`; ignored for `bria-rmbg-2.0`. |
@@ -235,6 +248,8 @@ If both `return_alpha` and `return_checker_preview` are true, `return_alpha` tak
 
 - First request per rembg model may download weights/cache the model before inference begins.
 - First request for `bria-rmbg-2.0` loads BRIA RMBG-2.0 from `BRIA_RMBG_2_MODEL_PATH`; if the mounted path is missing or unreadable, the API logs the exact path/status and returns a generic `500` response.
+- BRIA RMBG-2.0 cache keys are canonicalized after resolving `device=auto` and `dtype=auto`, so equivalent requests such as `device=auto&dtype=auto` and `device=cuda&dtype=fp16` reuse one CUDA fp16 backend instead of loading duplicate model copies.
+- After each BRIA request the service releases request-local tensors, runs `gc.collect()`, and by default calls `torch.cuda.empty_cache()`. Set `BRIA_RELEASE_CUDA_CACHE_AFTER_REQUEST=false` globally or pass `release_cuda_cache=false` on a request to leave PyTorch's CUDA allocator cache reserved.
 - BRIA RMBG-2.0 uses the model-card preprocessing normalization (`mean=[0.485,0.456,0.406]`, `std=[0.229,0.224,0.225]`) and requires its custom-code dependencies (`torch`, `torchvision`, `transformers`, `timm`, and `kornia`) in the image.
 - It is OK to have the RealESRGAN and rembg containers both started and models loaded, but avoid simultaneous inference if they share the same GPU/VRAM budget.
 - For the intended upscale-then-cutout workflow, run background removal on the already-upscaled image (for example `upscaled.png`) so the output mask aligns with the final image size.
@@ -253,6 +268,8 @@ If both `return_alpha` and `return_checker_preview` are true, `return_alpha` tak
 - **Model download/network failures:** pre-warm the rembg model cache in the runtime environment or ensure outbound network access during first use. BRIA RMBG-2.0 is intentionally local-path only.
 - **GPU image fails at startup with `ImportError: libcudart.so.13`:** rebuild from the current `Dockerfile.gpu`. The GPU image intentionally uses an NVIDIA CUDA 13 + cuDNN runtime base so the CUDA runtime shared libraries required by the pinned `onnxruntime-gpu` wheel are present in the container instead of depending on host filesystem libraries.
 - **GPU image still reports CPU only:** confirm the host has a working NVIDIA driver, NVIDIA Container Toolkit, and the container was started with `--gpus all` or the `rembg-api-gpu` compose service. Use `curl -sS http://localhost:8001/health` and look for `CUDAExecutionProvider` plus `bria_rmbg_2.cuda_available`.
+- **BRIA RMBG-2.0 VRAM appears to grow:** PyTorch keeps a CUDA caching allocator, so `nvidia-smi` can show reserved VRAM even after tensors are freed. This is different from live allocated tensor memory. Check `curl -sS http://localhost:8001/health` and compare `bria_rmbg_2.cuda_memory.allocated_bytes` versus `reserved_bytes`; `reserved_bytes` may stay high by design. The service now canonicalizes BRIA cache keys to avoid duplicate model loads for equivalent `auto`/explicit device and dtype settings, and defaults to emptying the CUDA cache after each BRIA request.
+- **Manually recover GPU memory:** for this LAN-local unauthenticated service, call `curl -sS -X POST http://localhost:8001/cache/clear` to clear cached rembg/BRIA backends and release CUDA cache. Watch host VRAM with `watch -n 1 nvidia-smi` before and after requests/cache clears. If you intentionally want PyTorch to keep allocator cache warm between BRIA requests, set `BRIA_RELEASE_CUDA_CACHE_AFTER_REQUEST=false` or pass `release_cuda_cache=false`.
 - **OpenCV/onnxruntime library errors in containers:** the Dockerfiles install `libglib2.0-0` and `libgl1`, which are commonly required by rembg's dependency stack.
 - **Large image memory use:** start with `model_input_size=1024`, lower it to `512` for BRIA RMBG-2.0 if memory is constrained, or try `u2netp` for the rembg backend.
 
