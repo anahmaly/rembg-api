@@ -188,5 +188,12 @@ async def remove_background(
     except HTTPException:
         raise
     except Exception as exc:
-        logger.exception("remove-background failed: %r", exc)
+        logger.exception(
+            "remove-background failed: model=%s model_input_size=%s device=%s dtype=%s error=%r",
+            model,
+            model_input_size,
+            device,
+            dtype,
+            exc,
+        )
         raise HTTPException(status_code=500, detail="Internal image processing error") from exc

@@ -42,7 +42,7 @@ Container path, configurable with `BRIA_RMBG_2_MODEL_PATH` and defaulting to thi
 
 ### CPU image
 
-`Dockerfile.cpu` installs the Python dependencies from `pyproject.toml`, including the torch/transformers stack used by BRIA RMBG-2.0. It is the safest choice when no NVIDIA runtime is available; BRIA inference will be much slower on CPU.
+`Dockerfile.cpu` installs the Python dependencies from `pyproject.toml`, including the torch/transformers/timm/kornia stack used by BRIA RMBG-2.0. It is the safest choice when no NVIDIA runtime is available; BRIA inference will be much slower on CPU.
 
 There is intentionally no default `Dockerfile` in this repository. Use `-f Dockerfile.cpu` or `-f Dockerfile.gpu` so the selected runtime is explicit; plain `docker build .` is not documented or supported for choosing CPU vs GPU.
 
@@ -75,12 +75,15 @@ The CPU service builds from `Dockerfile.cpu` explicitly and mounts `${HOME}/mode
 docker compose up --build rembg-api
 ```
 
-### GPU compose service
+### Dedicated GPU compose file
 
-The GPU service is behind the `gpu` profile, uses `gpus: all`, and mounts `${HOME}/models/briaai/RMBG-2.0` to `/models/briaai/RMBG-2.0:ro` so you can test BRIA RMBG-2.0 without rebuilding.
+`compose.gpu.yml` is the convenience path for GPU runs. It builds from `Dockerfile.gpu`, requests `gpus: all`, exposes `8001:8001`, mounts the BRIA RMBG-2.0 model read-only from `${HOME}/models/briaai/RMBG-2.0`, and keeps rembg model downloads in the named `rembg-model-cache` volume.
 
 ```bash
-docker compose --profile gpu up --build rembg-api-gpu
+docker compose -f compose.gpu.yml up -d --build
+docker compose -f compose.gpu.yml logs -f
+curl -sS http://localhost:8001/health
+docker compose -f compose.gpu.yml down
 ```
 
 The service listens on <http://localhost:8001> for both CPU and GPU modes.
@@ -232,6 +235,7 @@ If both `return_alpha` and `return_checker_preview` are true, `return_alpha` tak
 
 - First request per rembg model may download weights/cache the model before inference begins.
 - First request for `bria-rmbg-2.0` loads BRIA RMBG-2.0 from `BRIA_RMBG_2_MODEL_PATH`; if the mounted path is missing or unreadable, the API logs the exact path/status and returns a generic `500` response.
+- BRIA RMBG-2.0 uses the model-card preprocessing normalization (`mean=[0.485,0.456,0.406]`, `std=[0.229,0.224,0.225]`) and requires its custom-code dependencies (`torch`, `torchvision`, `transformers`, `timm`, and `kornia`) in the image.
 - It is OK to have the RealESRGAN and rembg containers both started and models loaded, but avoid simultaneous inference if they share the same GPU/VRAM budget.
 - For the intended upscale-then-cutout workflow, run background removal on the already-upscaled image (for example `upscaled.png`) so the output mask aligns with the final image size.
 
@@ -244,6 +248,7 @@ If both `return_alpha` and `return_checker_preview` are true, `return_alpha` tak
 ## Troubleshooting
 
 - **Slow first request:** rembg downloads model weights the first time a rembg model is used; BRIA RMBG-2.0 loads local model files the first time `model=bria-rmbg-2.0` is used for a path/device/dtype tuple.
+- **BRIA RMBG-2.0 request immediately returns generic `500`:** check container logs for the server-side error. If logs mention missing `timm` or `kornia`, pull this hotfix and rebuild the image (`docker build ... --no-cache` or `docker compose --profile gpu up --build rembg-api-gpu`) so pyproject dependencies are reinstalled.
 - **BRIA RMBG-2.0 path unavailable:** confirm `~/models/briaai/RMBG-2.0` exists on the host and is mounted exactly as `/models/briaai/RMBG-2.0:ro`. Check `/health` or `/models` for `model_path_available`.
 - **Model download/network failures:** pre-warm the rembg model cache in the runtime environment or ensure outbound network access during first use. BRIA RMBG-2.0 is intentionally local-path only.
 - **GPU image fails at startup with `ImportError: libcudart.so.13`:** rebuild from the current `Dockerfile.gpu`. The GPU image intentionally uses an NVIDIA CUDA 13 + cuDNN runtime base so the CUDA runtime shared libraries required by the pinned `onnxruntime-gpu` wheel are present in the container instead of depending on host filesystem libraries.

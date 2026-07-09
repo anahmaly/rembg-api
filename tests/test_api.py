@@ -7,7 +7,13 @@ from typing import Any, cast
 from fastapi.testclient import TestClient
 from PIL import Image
 from rembg_api import main
-from rembg_api.bria_rmbg import local_model_status
+from rembg_api.bria_rmbg import (
+    BRIA_RMBG_2_NORMALIZE_MEAN,
+    BRIA_RMBG_2_NORMALIZE_STD,
+    BRIA_RMBG_2_REQUIRED_MODULES,
+    _check_bria_runtime_dependencies,
+    local_model_status,
+)
 
 from helpers import make_png
 
@@ -168,6 +174,36 @@ def test_local_model_status_reports_missing_and_available_paths(tmp_path: Path) 
     assert available.exists is True
     assert available.is_dir is True
     assert available.readable is True
+
+
+def test_bria_preprocess_normalization_matches_model_card() -> None:
+    assert BRIA_RMBG_2_NORMALIZE_MEAN == (0.485, 0.456, 0.406)
+    assert BRIA_RMBG_2_NORMALIZE_STD == (0.229, 0.224, 0.225)
+
+
+def test_bria_runtime_dependency_check_reports_missing_timm_and_kornia(monkeypatch) -> None:
+    def fake_import_module(name: str):
+        if name in {"timm", "kornia"}:
+            raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+        return object()
+
+    monkeypatch.setattr("rembg_api.bria_rmbg.importlib.import_module", fake_import_module)
+
+    try:
+        _check_bria_runtime_dependencies()
+    except RuntimeError as exc:
+        message = str(exc)
+    else:  # pragma: no cover - defensive assertion
+        raise AssertionError("expected missing dependencies to raise RuntimeError")
+
+    assert "missing=timm,kornia" in message
+    assert "Rebuild the container" in message
+
+
+def test_bria_required_runtime_modules_include_custom_code_dependencies() -> None:
+    assert {"torch", "torchvision", "transformers", "timm", "kornia"}.issubset(
+        BRIA_RMBG_2_REQUIRED_MODULES
+    )
 
 
 def test_bria_backend_failure_returns_generic_500_and_logs_exact_error(monkeypatch, caplog) -> None:

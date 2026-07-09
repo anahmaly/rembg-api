@@ -1,0 +1,17 @@
+services:
+  rembg-api-gpu:
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
+    ports:
+      - "8001:8001"
+    environment:
+      - OMP_NUM_THREADS=1
+      - BRIA_RMBG_2_MODEL_PATH=/models/briaai/RMBG-2.0
+    volumes:
+      - ${HOME}/models/briaai/RMBG-2.0:/models/briaai/RMBG-2.0:ro
+      - rembg-model-cache:/root/.u2net
+    gpus: all
+
+volumes:
+  rembg-model-cache:
