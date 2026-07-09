@@ -1,0 +1,7 @@
+services:
+  rembg-api:
+    build: .
+    ports:
+      - "8001:8001"
+    environment:
+      - OMP_NUM_THREADS=1
