@@ -2,7 +2,7 @@ services:
   rembg-api:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.cpu
     ports:
       - "8001:8001"
     environment:

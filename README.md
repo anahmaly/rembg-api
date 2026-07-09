@@ -23,12 +23,14 @@ The first request for a model may download model weights into rembg/onnxruntime'
 
 ## Run with Docker
 
-### CPU image (default)
+### CPU image
 
-`Dockerfile` installs `onnxruntime` and is the safest default when no NVIDIA runtime is available.
+`Dockerfile.cpu` installs `onnxruntime` and is the safest choice when no NVIDIA runtime is available.
+
+There is intentionally no default `Dockerfile` in this repository. Use `-f Dockerfile.cpu` or `-f Dockerfile.gpu` so the selected runtime is explicit; plain `docker build .` is not documented or supported for choosing CPU vs GPU.
 
 ```bash
-docker build -t rembg-api:cpu -f Dockerfile .
+docker build -t rembg-api:cpu -f Dockerfile.cpu .
 docker run --rm -p 8001:8001 rembg-api:cpu
 ```
 
@@ -45,6 +47,8 @@ curl -sS http://localhost:8001/health
 ## Run with Docker Compose
 
 ### CPU compose service
+
+The CPU service builds from `Dockerfile.cpu` explicitly.
 
 ```bash
 docker compose up --build rembg-api
