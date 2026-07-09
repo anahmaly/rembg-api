@@ -13,10 +13,13 @@ from rembg_api.bria_rmbg import (
     BRIA_RMBG_2_MODEL_ID,
     BriaDevice,
     BriaDType,
+    clear_bria_backend_cache,
     configured_model_path,
     get_torch_status,
     local_model_status,
+    release_request_memory,
     remove_with_bria_rmbg_2,
+    should_release_cuda_cache_after_request,
 )
 from rembg_api.image_processing import AlphaOptions, DespillOptions, process_png_bytes
 
@@ -100,6 +103,19 @@ def models() -> dict[str, object]:
     }
 
 
+@app.post("/cache/clear")
+def clear_caches(
+    release_cuda_cache: Annotated[
+        bool,
+        Query(description="Run torch.cuda.empty_cache() after clearing caches when CUDA is available"),
+    ] = True,
+) -> dict[str, object]:
+    """Clear cached rembg sessions and BRIA backends for LAN-local resource recovery."""
+    get_session.cache_clear()
+    clear_bria_backend_cache(release_cuda_cache=release_cuda_cache)
+    return {"status": "ok", "rembg_sessions_cleared": True, "bria_backends_cleared": True}
+
+
 @app.post(
     "/remove-background/",
     response_class=Response,
@@ -134,6 +150,15 @@ async def remove_background(
     return_alpha: Annotated[bool, Query(description="Return grayscale alpha PNG bytes")] = False,
     return_checker_preview: Annotated[bool, Query(description="Return checker-composited preview PNG bytes")] = False,
     checker_size: Annotated[int, Query(ge=2, le=128)] = 32,
+    release_cuda_cache: Annotated[
+        bool | None,
+        Query(
+            description=(
+                "BRIA RMBG-2.0 only: call torch.cuda.empty_cache() after the request. "
+                "Defaults to BRIA_RELEASE_CUDA_CACHE_AFTER_REQUEST, true when unset."
+            )
+        ),
+    ] = None,
 ) -> Response:
     if output_format != "png":
         raise HTTPException(status_code=400, detail="Only png output_format is supported")
@@ -142,13 +167,20 @@ async def remove_background(
     if not input_bytes:
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
 
+    bria_request = model == BRIA_RMBG_2_MODEL_ID
+    should_release_bria_cuda_cache = (
+        should_release_cuda_cache_after_request() if release_cuda_cache is None else release_cuda_cache
+    )
+
     try:
-        if model == BRIA_RMBG_2_MODEL_ID:
+        if bria_request:
             removed = remove_with_bria_rmbg_2(
                 input_bytes,
                 model_input_size=model_input_size,
                 device=device,
                 dtype=dtype,
+                release_cuda_cache=release_cuda_cache,
+                cleanup_after_request=False,
             )
         else:
             session = get_session(model)
@@ -197,3 +229,6 @@ async def remove_background(
             exc,
         )
         raise HTTPException(status_code=500, detail="Internal image processing error") from exc
+    finally:
+        if bria_request:
+            release_request_memory(release_cuda_cache=should_release_bria_cuda_cache)
