@@ -3,7 +3,24 @@ from __future__ import annotations
 from pathlib import Path
 
 
-GPU_DOCKERFILE = Path(__file__).resolve().parents[1] / "Dockerfile.gpu"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+CPU_DOCKERFILE = REPO_ROOT / "Dockerfile.cpu"
+DEFAULT_DOCKERFILE = REPO_ROOT / "Dockerfile"
+GPU_DOCKERFILE = REPO_ROOT / "Dockerfile.gpu"
+COMPOSE_FILE = REPO_ROOT / "compose.yml"
+
+
+def test_cpu_dockerfile_is_explicit_and_no_default_dockerfile_exists() -> None:
+    assert CPU_DOCKERFILE.is_file()
+    assert not DEFAULT_DOCKERFILE.exists()
+
+
+def test_compose_services_reference_explicit_dockerfiles() -> None:
+    compose = COMPOSE_FILE.read_text(encoding="utf-8")
+
+    assert "dockerfile: Dockerfile.cpu" in compose
+    assert "dockerfile: Dockerfile.gpu" in compose
+    assert "dockerfile: Dockerfile\n" not in compose
 
 
 def test_gpu_dockerfile_uses_cuda_13_cudnn_runtime_base() -> None:
