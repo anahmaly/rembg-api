@@ -1,6 +1,6 @@
 # rembg-api
 
-Thin FastAPI bytes-in/bytes-out wrapper around [`rembg`](https://github.com/danielgatis/rembg). This project is a wrapper service, not a fork of `rembg`.
+Thin FastAPI bytes-in/bytes-out wrapper around [`rembg`](https://github.com/danielgatis/rembg). This project is a wrapper service, not a fork of `rembg`. It can also run BRIA RMBG-2.0 from a pre-downloaded local model directory.
 
 ## API shape
 
@@ -8,7 +8,8 @@ Thin FastAPI bytes-in/bytes-out wrapper around [`rembg`](https://github.com/dani
 - The response is PNG bytes (`Content-Type: image/png`).
 - Normal requests do not require temporary filesystem files; input and output are handled as bytes in process.
 - OpenAPI docs are available from FastAPI at `/docs` and `/openapi.json`.
-- `GET /health` reports the ONNX Runtime execution providers available inside the running container/process, so you can verify CPU vs CUDA without shelling into the container.
+- `GET /health` reports ONNX Runtime provider availability plus BRIA RMBG-2.0 torch/CUDA and local-path status without downloading weights.
+- `GET /models` lists supported model IDs and whether the configured BRIA RMBG-2.0 path is present/readable.
 
 ## Run locally
 
@@ -19,28 +20,48 @@ uv pip install -e .
 uvicorn rembg_api.main:app --host 0.0.0.0 --port 8001
 ```
 
-The first request for a model may download model weights into rembg/onnxruntime's normal cache.
+The first request for a rembg model may download model weights into rembg/onnxruntime's normal cache. BRIA RMBG-2.0 never downloads from Hugging Face at request time; it loads from the configured local path.
+
+## BRIA RMBG-2.0 local model setup
+
+BRIA RMBG-2.0 is a gated Hugging Face model with non-commercial terms unless you have a separate license. This service does not fetch gated weights or accept an HF token in the container. Download or otherwise place the licensed model files on the host first, then mount that exact directory read-only into the container.
+
+Expected host path:
+
+```bash
+~/models/briaai/RMBG-2.0
+```
+
+Container path, configurable with `BRIA_RMBG_2_MODEL_PATH` and defaulting to this exact value:
+
+```bash
+/models/briaai/RMBG-2.0
+```
 
 ## Run with Docker
 
 ### CPU image
 
-`Dockerfile.cpu` installs `onnxruntime` and is the safest choice when no NVIDIA runtime is available.
+`Dockerfile.cpu` installs the Python dependencies from `pyproject.toml`, including the torch/transformers stack used by BRIA RMBG-2.0. It is the safest choice when no NVIDIA runtime is available; BRIA inference will be much slower on CPU.
 
 There is intentionally no default `Dockerfile` in this repository. Use `-f Dockerfile.cpu` or `-f Dockerfile.gpu` so the selected runtime is explicit; plain `docker build .` is not documented or supported for choosing CPU vs GPU.
 
 ```bash
 docker build -t rembg-api:cpu -f Dockerfile.cpu .
-docker run --rm -p 8001:8001 rembg-api:cpu
+docker run --rm -p 8001:8001 \
+  -v ~/models/briaai/RMBG-2.0:/models/briaai/RMBG-2.0:ro \
+  rembg-api:cpu
 ```
 
 ### GPU image
 
-`Dockerfile.gpu` uses an NVIDIA CUDA 13 + cuDNN runtime base image and installs a pinned `onnxruntime-gpu` wheel that expects CUDA runtime libraries such as `libcudart.so.13` to be present inside the container. Use it on a host with a compatible NVIDIA driver and the NVIDIA Container Toolkit installed.
+`Dockerfile.gpu` uses an NVIDIA CUDA 13 + cuDNN runtime base image, installs CUDA PyTorch/torchvision, and installs a pinned `onnxruntime-gpu` wheel that expects CUDA runtime libraries such as `libcudart.so.13` to be present inside the container. Use it on a host with a compatible NVIDIA driver and the NVIDIA Container Toolkit installed.
 
 ```bash
 docker build -t rembg-api:gpu -f Dockerfile.gpu .
-docker run --rm --gpus all -p 8001:8001 rembg-api:gpu
+docker run --rm --gpus all -p 8001:8001 \
+  -v ~/models/briaai/RMBG-2.0:/models/briaai/RMBG-2.0:ro \
+  rembg-api:gpu
 curl -sS http://localhost:8001/health
 ```
 
@@ -48,7 +69,7 @@ curl -sS http://localhost:8001/health
 
 ### CPU compose service
 
-The CPU service builds from `Dockerfile.cpu` explicitly.
+The CPU service builds from `Dockerfile.cpu` explicitly and mounts `${HOME}/models/briaai/RMBG-2.0` to `/models/briaai/RMBG-2.0:ro`.
 
 ```bash
 docker compose up --build rembg-api
@@ -56,7 +77,7 @@ docker compose up --build rembg-api
 
 ### GPU compose service
 
-The GPU service is behind the `gpu` profile and uses `gpus: all` so you can choose it without editing compose files.
+The GPU service is behind the `gpu` profile, uses `gpus: all`, and mounts `${HOME}/models/briaai/RMBG-2.0` to `/models/briaai/RMBG-2.0:ro` so you can test BRIA RMBG-2.0 without rebuilding.
 
 ```bash
 docker compose --profile gpu up --build rembg-api-gpu
@@ -79,18 +100,30 @@ CPU images should report at least `CPUExecutionProvider`:
   "status": "ok",
   "onnxruntime_available_providers": ["CPUExecutionProvider"],
   "preferred_provider": "CPUExecutionProvider",
-  "gpu_available": false
+  "gpu_available": false,
+  "bria_rmbg_2": {
+    "model_path": "/models/briaai/RMBG-2.0",
+    "model_path_available": true,
+    "torch_available": true,
+    "cuda_available": false
+  }
 }
 ```
 
-GPU images should include `CUDAExecutionProvider` when Docker/NVIDIA runtime wiring is working:
+GPU images should include `CUDAExecutionProvider` when Docker/NVIDIA runtime wiring is working, and `bria_rmbg_2.cuda_available` should be `true` when torch can see CUDA:
 
 ```json
 {
   "status": "ok",
   "onnxruntime_available_providers": ["CUDAExecutionProvider", "CPUExecutionProvider"],
   "preferred_provider": "CUDAExecutionProvider",
-  "gpu_available": true
+  "gpu_available": true,
+  "bria_rmbg_2": {
+    "model_path": "/models/briaai/RMBG-2.0",
+    "model_path_available": true,
+    "torch_available": true,
+    "cuda_available": true
+  }
 }
 ```
 
@@ -103,26 +136,17 @@ print(ort.get_available_providers())
 PY
 ```
 
-`/health` only imports ONNX Runtime and asks for available providers; it does not create a rembg session or download model weights.
+`/health` imports ONNX Runtime and checks torch/local-path availability; it does not create a rembg session, load BRIA RMBG-2.0, or download model weights.
 
 ## Endpoints
 
 ### `GET /health`
 
-Returns service status plus ONNX Runtime provider observability:
-
-```json
-{
-  "status": "ok",
-  "onnxruntime_available_providers": ["CPUExecutionProvider"],
-  "preferred_provider": "CPUExecutionProvider",
-  "gpu_available": false
-}
-```
+Returns service status plus ONNX Runtime provider observability and BRIA RMBG-2.0 local model status.
 
 ### `GET /models`
 
-Returns the default model and supported model names.
+Returns the default model, supported model names, and BRIA RMBG-2.0 configured local-path availability.
 
 ### `POST /remove-background/`
 
@@ -140,6 +164,14 @@ Run rembg on an already-upscaled image:
 curl -sS -X POST "http://localhost:8001/remove-background/?model=isnet-general-use" \
   -F "file=@upscaled.png" \
   --output upscaled-no-bg.png
+```
+
+Run BRIA RMBG-2.0 from the mounted local model path against a large PNG, for example a 10k PNG:
+
+```bash
+curl -sS -X POST "http://localhost:8001/remove-background/?model=bria-rmbg-2.0&model_input_size=1024&device=auto&dtype=auto" \
+  -F "file=@10k.png" \
+  --output 10k-bria-rmbg-2.png
 ```
 
 Choose a model and composite over white:
@@ -170,19 +202,22 @@ curl -sS -X POST "http://localhost:8001/remove-background/?return_checker_previe
 
 | Parameter | Default | Notes |
 | --- | --- | --- |
-| `model` | `isnet-general-use` | One of `isnet-general-use`, `u2net`, `u2netp`, `isnet-anime`, `silueta`. Sessions are cached by model in process. |
-| `only_mask` | `false` | Passed through to `rembg.remove`. |
-| `post_process_mask` | `false` | Passed through to `rembg.remove`. |
-| `alpha_matting` | `false` | Passed through to `rembg.remove`. |
-| `alpha_matting_foreground_threshold` | `240` | Integer, `0..255`. |
-| `alpha_matting_background_threshold` | `10` | Integer, `0..255`. |
-| `alpha_matting_erode_size` | `10` | Integer, `>=0`. |
+| `model` | `isnet-general-use` | One of `isnet-general-use`, `u2net`, `u2netp`, `isnet-anime`, `silueta`, `bria-rmbg-2.0`. rembg sessions are cached by model; BRIA backend is cached by local path/device/dtype. |
+| `model_input_size` | `1024` | BRIA RMBG-2.0 square input size, `512..2048`. It affects preprocessing only and does not reload the model. |
+| `device` | `auto` | BRIA RMBG-2.0 only: `auto`, `cuda`, or `cpu`. `auto` uses CUDA when torch sees it. |
+| `dtype` | `auto` | BRIA RMBG-2.0 only: `auto`, `fp16`, or `fp32`. `auto` uses fp16 on CUDA and fp32 on CPU. |
+| `only_mask` | `false` | Passed through to `rembg.remove`; ignored for `bria-rmbg-2.0`. |
+| `post_process_mask` | `false` | Passed through to `rembg.remove`; ignored for `bria-rmbg-2.0`. |
+| `alpha_matting` | `false` | Passed through to `rembg.remove`; ignored for `bria-rmbg-2.0`. |
+| `alpha_matting_foreground_threshold` | `240` | Integer, `0..255`; rembg only. |
+| `alpha_matting_background_threshold` | `10` | Integer, `0..255`; rembg only. |
+| `alpha_matting_erode_size` | `10` | Integer, `>=0`; rembg only. |
 | `output_format` | `png` | v1 supports PNG only. |
 | `background_color` | `transparent` | `transparent`, `white`, `black`, or `custom`. |
 | `background_hex` | `ffffff` | Six-digit RGB hex for `background_color=custom`; leading `#` is optional. |
-| `alpha_blur` | `0.0` | Gaussian blur radius, `0..20`; applied after rembg. |
-| `alpha_erode` | `0` | Shrinks alpha mask, `0..100`; applied after rembg. |
-| `alpha_dilate` | `0` | Expands alpha mask, `0..100`; applied after rembg. |
+| `alpha_blur` | `0.0` | Gaussian blur radius, `0..20`; applied after background removal. |
+| `alpha_erode` | `0` | Shrinks alpha mask, `0..100`; applied after background removal. |
+| `alpha_dilate` | `0` | Expands alpha mask, `0..100`; applied after background removal. |
 | `alpha_threshold` | `0` | `0` disables thresholding; otherwise binarizes alpha at `1..255`. |
 | `despill` | `false` | Enables simple edge despill. |
 | `despill_color` | `black` | `black`, `white`, `green`, `blue`, or `custom`. |
@@ -195,9 +230,10 @@ If both `return_alpha` and `return_checker_preview` are true, `return_alpha` tak
 
 ## Runtime notes
 
-- First request per model may download weights/cache the model before inference begins.
+- First request per rembg model may download weights/cache the model before inference begins.
+- First request for `bria-rmbg-2.0` loads BRIA RMBG-2.0 from `BRIA_RMBG_2_MODEL_PATH`; if the mounted path is missing or unreadable, the API logs the exact path/status and returns a generic `500` response.
 - It is OK to have the RealESRGAN and rembg containers both started and models loaded, but avoid simultaneous inference if they share the same GPU/VRAM budget.
-- For the intended upscale-then-cutout workflow, run rembg on the already-upscaled image (for example `upscaled.png`) so the output mask aligns with the final image size.
+- For the intended upscale-then-cutout workflow, run background removal on the already-upscaled image (for example `upscaled.png`) so the output mask aligns with the final image size.
 
 ## Errors
 
@@ -207,12 +243,13 @@ If both `return_alpha` and `return_checker_preview` are true, `return_alpha` tak
 
 ## Troubleshooting
 
-- **Slow first request:** rembg downloads model weights the first time a model is used.
-- **Model download/network failures:** pre-warm the model cache in the runtime environment or ensure outbound network access during first use.
+- **Slow first request:** rembg downloads model weights the first time a rembg model is used; BRIA RMBG-2.0 loads local model files the first time `model=bria-rmbg-2.0` is used for a path/device/dtype tuple.
+- **BRIA RMBG-2.0 path unavailable:** confirm `~/models/briaai/RMBG-2.0` exists on the host and is mounted exactly as `/models/briaai/RMBG-2.0:ro`. Check `/health` or `/models` for `model_path_available`.
+- **Model download/network failures:** pre-warm the rembg model cache in the runtime environment or ensure outbound network access during first use. BRIA RMBG-2.0 is intentionally local-path only.
 - **GPU image fails at startup with `ImportError: libcudart.so.13`:** rebuild from the current `Dockerfile.gpu`. The GPU image intentionally uses an NVIDIA CUDA 13 + cuDNN runtime base so the CUDA runtime shared libraries required by the pinned `onnxruntime-gpu` wheel are present in the container instead of depending on host filesystem libraries.
-- **GPU image still reports CPU only:** confirm the host has a working NVIDIA driver, NVIDIA Container Toolkit, and the container was started with `--gpus all` or the `rembg-api-gpu` compose service. Use `curl -sS http://localhost:8001/health` and look for `CUDAExecutionProvider`.
+- **GPU image still reports CPU only:** confirm the host has a working NVIDIA driver, NVIDIA Container Toolkit, and the container was started with `--gpus all` or the `rembg-api-gpu` compose service. Use `curl -sS http://localhost:8001/health` and look for `CUDAExecutionProvider` plus `bria_rmbg_2.cuda_available`.
 - **OpenCV/onnxruntime library errors in containers:** the Dockerfiles install `libglib2.0-0` and `libgl1`, which are commonly required by rembg's dependency stack.
-- **Large image memory use:** start with smaller inputs or `u2netp` if memory is constrained.
+- **Large image memory use:** start with `model_input_size=1024`, lower it to `512` for BRIA RMBG-2.0 if memory is constrained, or try `u2netp` for the rembg backend.
 
 ## Development
 
@@ -222,6 +259,7 @@ source .venv/bin/activate
 uv pip install -e ".[test]"
 python -m compileall src tests
 pytest -q
+git diff --check
 ```
 
-Tests monkeypatch `rembg.new_session`, `rembg.remove`, and ONNX Runtime provider discovery so they do not download models or require GPU packages.
+Tests monkeypatch `rembg.new_session`, `rembg.remove`, ONNX Runtime provider discovery, and the BRIA RMBG-2.0 local backend so they do not download models or require GPU/model weights.

@@ -9,22 +9,32 @@ from fastapi.responses import Response
 import onnxruntime as ort
 from rembg import new_session, remove
 
+from rembg_api.bria_rmbg import (
+    BRIA_RMBG_2_MODEL_ID,
+    BriaDevice,
+    BriaDType,
+    configured_model_path,
+    get_torch_status,
+    local_model_status,
+    remove_with_bria_rmbg_2,
+)
 from rembg_api.image_processing import AlphaOptions, DespillOptions, process_png_bytes
 
 logger = logging.getLogger(__name__)
 
-SupportedModel = Literal["isnet-general-use", "u2net", "u2netp", "isnet-anime", "silueta"]
+SupportedModel = Literal["isnet-general-use", "u2net", "u2netp", "isnet-anime", "silueta", "bria-rmbg-2.0"]
 OutputFormat = Literal["png"]
 BackgroundColor = Literal["transparent", "white", "black", "custom"]
 DespillColor = Literal["black", "white", "green", "blue", "custom"]
 
-SUPPORTED_MODELS: tuple[str, ...] = (
+REMBG_MODELS: tuple[str, ...] = (
     "isnet-general-use",
     "u2net",
     "u2netp",
     "isnet-anime",
     "silueta",
 )
+SUPPORTED_MODELS: tuple[str, ...] = (*REMBG_MODELS, BRIA_RMBG_2_MODEL_ID)
 
 app = FastAPI(
     title="rembg-api",
@@ -33,7 +43,7 @@ app = FastAPI(
 )
 
 
-@lru_cache(maxsize=len(SUPPORTED_MODELS))
+@lru_cache(maxsize=len(REMBG_MODELS))
 def get_session(model: str):
     return new_session(model)
 
@@ -54,16 +64,39 @@ def get_onnxruntime_provider_info() -> dict[str, str | bool | list[str]]:
     }
 
 
+def get_bria_model_info() -> dict[str, object]:
+    status = local_model_status()
+    return {
+        "model_path": status.path,
+        "model_path_exists": status.exists,
+        "model_path_is_dir": status.is_dir,
+        "model_path_readable": status.readable,
+        "model_path_available": status.available,
+        **get_torch_status(),
+    }
+
+
 @app.get("/health")
-def health() -> dict[str, str | bool | list[str]]:
-    return {"status": "ok", **get_onnxruntime_provider_info()}
+def health() -> dict[str, object]:
+    return {
+        "status": "ok",
+        **get_onnxruntime_provider_info(),
+        "bria_rmbg_2": get_bria_model_info(),
+    }
 
 
 @app.get("/models")
-def models() -> dict[str, str | list[str]]:
+def models() -> dict[str, object]:
     return {
         "default": "isnet-general-use",
         "supported": list(SUPPORTED_MODELS),
+        "details": {
+            BRIA_RMBG_2_MODEL_ID: {
+                "backend": "torch-transformers-local",
+                "configured_path": configured_model_path(),
+                **get_bria_model_info(),
+            }
+        },
     }
 
 
@@ -78,13 +111,16 @@ def models() -> dict[str, str | list[str]]:
 )
 async def remove_background(
     file: Annotated[UploadFile, File(description="Input image file bytes")],
-    model: Annotated[SupportedModel, Query(description="rembg model name")] = "isnet-general-use",
-    only_mask: Annotated[bool, Query(description="Return rembg's raw mask output")] = False,
-    post_process_mask: Annotated[bool, Query(description="Enable rembg mask post-processing")] = False,
-    alpha_matting: Annotated[bool, Query(description="Enable rembg alpha matting")] = False,
+    model: Annotated[SupportedModel, Query(description="Background-removal model name")] = "isnet-general-use",
+    only_mask: Annotated[bool, Query(description="Return rembg's raw mask output; ignored for bria-rmbg-2.0")] = False,
+    post_process_mask: Annotated[bool, Query(description="Enable rembg mask post-processing; ignored for bria-rmbg-2.0")] = False,
+    alpha_matting: Annotated[bool, Query(description="Enable rembg alpha matting; ignored for bria-rmbg-2.0")] = False,
     alpha_matting_foreground_threshold: Annotated[int, Query(ge=0, le=255)] = 240,
     alpha_matting_background_threshold: Annotated[int, Query(ge=0, le=255)] = 10,
     alpha_matting_erode_size: Annotated[int, Query(ge=0)] = 10,
+    model_input_size: Annotated[int, Query(ge=512, le=2048, description="BRIA RMBG-2.0 square model input size")] = 1024,
+    device: Annotated[BriaDevice, Query(description="BRIA RMBG-2.0 device selection")] = "auto",
+    dtype: Annotated[BriaDType, Query(description="BRIA RMBG-2.0 model precision")] = "auto",
     output_format: Annotated[OutputFormat, Query(description="Output image format; v1 supports PNG")] = "png",
     background_color: Annotated[BackgroundColor, Query(description="Optional background compositing mode")] = "transparent",
     background_hex: Annotated[str, Query(pattern=r"^#?[0-9a-fA-F]{6}$")] = "ffffff",
@@ -107,19 +143,27 @@ async def remove_background(
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
 
     try:
-        session = get_session(model)
-        removed = remove(
-            input_bytes,
-            session=session,
-            only_mask=only_mask,
-            post_process_mask=post_process_mask,
-            alpha_matting=alpha_matting,
-            alpha_matting_foreground_threshold=alpha_matting_foreground_threshold,
-            alpha_matting_background_threshold=alpha_matting_background_threshold,
-            alpha_matting_erode_size=alpha_matting_erode_size,
-        )
+        if model == BRIA_RMBG_2_MODEL_ID:
+            removed = remove_with_bria_rmbg_2(
+                input_bytes,
+                model_input_size=model_input_size,
+                device=device,
+                dtype=dtype,
+            )
+        else:
+            session = get_session(model)
+            removed = remove(
+                input_bytes,
+                session=session,
+                only_mask=only_mask,
+                post_process_mask=post_process_mask,
+                alpha_matting=alpha_matting,
+                alpha_matting_foreground_threshold=alpha_matting_foreground_threshold,
+                alpha_matting_background_threshold=alpha_matting_background_threshold,
+                alpha_matting_erode_size=alpha_matting_erode_size,
+            )
         if not isinstance(removed, bytes):
-            raise RuntimeError(f"rembg.remove returned {type(removed)!r}, expected bytes")
+            raise RuntimeError(f"background removal returned {type(removed)!r}, expected bytes")
 
         output_bytes = process_png_bytes(
             removed,

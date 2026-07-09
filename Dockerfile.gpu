@@ -7,6 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:${PATH}"
 
 ARG ONNXRUNTIME_GPU_VERSION=1.27.0
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
 
 WORKDIR /app
 
@@ -29,7 +30,8 @@ COPY src ./src
 # with ONNXRUNTIME_GPU_VERSION; onnxruntime-gpu 1.27.x loads libcudart.so.13.
 # Install the CUDA-enabled ONNX Runtime wheel last so the `onnxruntime` module
 # exposed in this container comes from onnxruntime-gpu.
-RUN pip install . \
+RUN pip install --index-url "${TORCH_INDEX_URL}" torch torchvision \
+    && pip install . \
     && pip install "onnxruntime-gpu==${ONNXRUNTIME_GPU_VERSION}"
 
 EXPOSE 8001

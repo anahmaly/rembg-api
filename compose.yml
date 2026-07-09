@@ -7,6 +7,9 @@ services:
       - "8001:8001"
     environment:
       - OMP_NUM_THREADS=1
+      - BRIA_RMBG_2_MODEL_PATH=/models/briaai/RMBG-2.0
+    volumes:
+      - ${HOME}/models/briaai/RMBG-2.0:/models/briaai/RMBG-2.0:ro
 
   rembg-api-gpu:
     profiles: ["gpu"]
@@ -17,4 +20,7 @@ services:
       - "8001:8001"
     environment:
       - OMP_NUM_THREADS=1
+      - BRIA_RMBG_2_MODEL_PATH=/models/briaai/RMBG-2.0
+    volumes:
+      - ${HOME}/models/briaai/RMBG-2.0:/models/briaai/RMBG-2.0:ro
     gpus: all
