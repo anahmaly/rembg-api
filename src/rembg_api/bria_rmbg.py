@@ -4,6 +4,7 @@ import logging
 import os
 from dataclasses import dataclass
 from functools import lru_cache
+import importlib
 from io import BytesIO
 from pathlib import Path
 from typing import Literal
@@ -15,6 +16,15 @@ logger = logging.getLogger(__name__)
 BRIA_RMBG_2_MODEL_ID = "bria-rmbg-2.0"
 DEFAULT_BRIA_RMBG_2_MODEL_PATH = "/models/briaai/RMBG-2.0"
 BRIA_RMBG_2_MODEL_PATH_ENV = "BRIA_RMBG_2_MODEL_PATH"
+BRIA_RMBG_2_NORMALIZE_MEAN = (0.485, 0.456, 0.406)
+BRIA_RMBG_2_NORMALIZE_STD = (0.229, 0.224, 0.225)
+BRIA_RMBG_2_REQUIRED_MODULES = (
+    "torch",
+    "torchvision",
+    "transformers",
+    "timm",
+    "kornia",
+)
 
 BriaDevice = Literal["auto", "cuda", "cpu"]
 BriaDType = Literal["auto", "fp16", "fp32"]
@@ -89,6 +99,47 @@ def _resolve_dtype(requested: BriaDType, device):
     return torch.float16 if device.type == "cuda" else torch.float32
 
 
+def _check_bria_runtime_dependencies() -> None:
+    missing: list[str] = []
+    errors: dict[str, str] = {}
+    for module_name in BRIA_RMBG_2_REQUIRED_MODULES:
+        try:
+            importlib.import_module(module_name)
+        except ModuleNotFoundError as exc:
+            if exc.name == module_name or (exc.name is not None and exc.name.startswith(f"{module_name}.")):
+                missing.append(module_name)
+            else:
+                errors[module_name] = repr(exc)
+        except Exception as exc:  # pragma: no cover - depends on binary runtime
+            errors[module_name] = repr(exc)
+
+    if missing or errors:
+        detail_parts: list[str] = []
+        if missing:
+            detail_parts.append(f"missing={','.join(missing)}")
+        if errors:
+            detail_parts.append(
+                "import_errors=" + ",".join(f"{name}:{error}" for name, error in errors.items())
+            )
+        raise RuntimeError(
+            "BRIA RMBG-2.0 runtime dependencies are unavailable; "
+            + " ".join(detail_parts)
+            + ". Rebuild the container after installing pyproject dependencies."
+        )
+
+
+def build_bria_preprocess_transform(model_input_size: int):
+    from torchvision import transforms
+
+    return transforms.Compose(
+        [
+            transforms.Resize((model_input_size, model_input_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(BRIA_RMBG_2_NORMALIZE_MEAN, BRIA_RMBG_2_NORMALIZE_STD),
+        ]
+    )
+
+
 class BriaRmbg2Backend:
     def __init__(self, model_path: str, device: BriaDevice, dtype: BriaDType) -> None:
         status = local_model_status(model_path)
@@ -98,13 +149,10 @@ class BriaRmbg2Backend:
                 f"path={status.path!r} exists={status.exists} is_dir={status.is_dir} readable={status.readable}"
             )
 
-        try:
-            import torch
-            from transformers import AutoModelForImageSegmentation
-        except Exception as exc:
-            raise RuntimeError(
-                "BRIA RMBG-2.0 requires torch and transformers to be installed in this runtime"
-            ) from exc
+        _check_bria_runtime_dependencies()
+
+        import torch
+        from transformers import AutoModelForImageSegmentation
 
         self.torch = torch
         self.model_path = model_path
@@ -128,13 +176,7 @@ class BriaRmbg2Backend:
         rgb = original.convert("RGB")
         original_size = (rgb.height, rgb.width)
 
-        transform = transforms.Compose(
-            [
-                transforms.Resize((model_input_size, model_input_size)),
-                transforms.ToTensor(),
-                transforms.Normalize([0.5, 0.5, 0.5], [1.0, 1.0, 1.0]),
-            ]
-        )
+        transform = build_bria_preprocess_transform(model_input_size)
         inputs = transform(rgb).unsqueeze(0).to(device=self.device, dtype=self.dtype)
 
         with torch.inference_mode():
