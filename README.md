@@ -34,11 +34,12 @@ docker run --rm -p 8001:8001 rembg-api:cpu
 
 ### GPU image
 
-`Dockerfile.gpu` installs `onnxruntime-gpu`. Use it on a host with the NVIDIA Container Toolkit installed and a compatible driver/CUDA runtime available to Docker.
+`Dockerfile.gpu` uses an NVIDIA CUDA 13 + cuDNN runtime base image and installs a pinned `onnxruntime-gpu` wheel that expects CUDA runtime libraries such as `libcudart.so.13` to be present inside the container. Use it on a host with a compatible NVIDIA driver and the NVIDIA Container Toolkit installed.
 
 ```bash
 docker build -t rembg-api:gpu -f Dockerfile.gpu .
 docker run --rm --gpus all -p 8001:8001 rembg-api:gpu
+curl -sS http://localhost:8001/health
 ```
 
 ## Run with Docker Compose
@@ -204,7 +205,8 @@ If both `return_alpha` and `return_checker_preview` are true, `return_alpha` tak
 
 - **Slow first request:** rembg downloads model weights the first time a model is used.
 - **Model download/network failures:** pre-warm the model cache in the runtime environment or ensure outbound network access during first use.
-- **GPU image still reports CPU only:** confirm the host has a working NVIDIA driver, NVIDIA Container Toolkit, and the container was started with `--gpus all` or the `rembg-api-gpu` compose service.
+- **GPU image fails at startup with `ImportError: libcudart.so.13`:** rebuild from the current `Dockerfile.gpu`. The GPU image intentionally uses an NVIDIA CUDA 13 + cuDNN runtime base so the CUDA runtime shared libraries required by the pinned `onnxruntime-gpu` wheel are present in the container instead of depending on host filesystem libraries.
+- **GPU image still reports CPU only:** confirm the host has a working NVIDIA driver, NVIDIA Container Toolkit, and the container was started with `--gpus all` or the `rembg-api-gpu` compose service. Use `curl -sS http://localhost:8001/health` and look for `CUDAExecutionProvider`.
 - **OpenCV/onnxruntime library errors in containers:** the Dockerfiles install `libglib2.0-0` and `libgl1`, which are commonly required by rembg's dependency stack.
 - **Large image memory use:** start with smaller inputs or `u2netp` if memory is constrained.
 

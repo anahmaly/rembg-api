@@ -1,24 +1,36 @@
-FROM python:3.11-slim
+FROM nvidia/cuda:13.0.3-cudnn-runtime-ubuntu24.04
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    VIRTUAL_ENV=/opt/venv \
+    PATH="/opt/venv/bin:${PATH}"
+
+ARG ONNXRUNTIME_GPU_VERSION=1.27.0
 
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libglib2.0-0 libgl1 \
+    && apt-get install -y --no-install-recommends \
+        libglib2.0-0 \
+        libgl1 \
+        python3 \
+        python3-pip \
+        python3-venv \
+    && python3 -m venv "$VIRTUAL_ENV" \
+    && "$VIRTUAL_ENV/bin/pip" install --upgrade pip \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml README.md ./
 COPY src ./src
 
-# Install the app normally, then install the CUDA-enabled ONNX Runtime wheel last.
-# The resulting Python module name remains `onnxruntime`, and /health reports the
-# providers exposed by the runtime in this container.
-RUN pip install --upgrade pip \
-    && pip install . \
-    && pip install "onnxruntime-gpu>=1.18.0"
+# The GPU image must carry the CUDA runtime libraries required by the
+# onnxruntime-gpu wheel. Keep the CUDA major version in the base image aligned
+# with ONNXRUNTIME_GPU_VERSION; onnxruntime-gpu 1.27.x loads libcudart.so.13.
+# Install the CUDA-enabled ONNX Runtime wheel last so the `onnxruntime` module
+# exposed in this container comes from onnxruntime-gpu.
+RUN pip install . \
+    && pip install "onnxruntime-gpu==${ONNXRUNTIME_GPU_VERSION}"
 
 EXPOSE 8001
 
