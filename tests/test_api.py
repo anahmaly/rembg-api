@@ -9,11 +9,38 @@ from rembg_api import main
 from helpers import make_png
 
 
-def test_health() -> None:
+def test_health(monkeypatch) -> None:
+    monkeypatch.setattr(
+        main.ort,
+        "get_available_providers",
+        lambda: ["CPUExecutionProvider"],
+    )
     client = TestClient(main.app)
     response = client.get("/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    assert response.json() == {
+        "status": "ok",
+        "onnxruntime_available_providers": ["CPUExecutionProvider"],
+        "preferred_provider": "CPUExecutionProvider",
+        "gpu_available": False,
+    }
+
+
+def test_health_reports_cuda_provider_when_available(monkeypatch) -> None:
+    monkeypatch.setattr(
+        main.ort,
+        "get_available_providers",
+        lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+    client = TestClient(main.app)
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ok",
+        "onnxruntime_available_providers": ["CUDAExecutionProvider", "CPUExecutionProvider"],
+        "preferred_provider": "CUDAExecutionProvider",
+        "gpu_available": True,
+    }
 
 
 def test_models_lists_supported_default() -> None:

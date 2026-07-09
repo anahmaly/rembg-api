@@ -6,6 +6,7 @@ from typing import Annotated, Literal
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
+import onnxruntime as ort
 from rembg import new_session, remove
 
 from rembg_api.image_processing import AlphaOptions, DespillOptions, process_png_bytes
@@ -37,9 +38,25 @@ def get_session(model: str):
     return new_session(model)
 
 
+def get_onnxruntime_provider_info() -> dict[str, str | bool | list[str]]:
+    providers = list(ort.get_available_providers())
+    if "CUDAExecutionProvider" in providers:
+        preferred_provider = "CUDAExecutionProvider"
+    elif providers:
+        preferred_provider = providers[0]
+    else:
+        preferred_provider = "unavailable"
+
+    return {
+        "onnxruntime_available_providers": providers,
+        "preferred_provider": preferred_provider,
+        "gpu_available": "CUDAExecutionProvider" in providers,
+    }
+
+
 @app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+def health() -> dict[str, str | bool | list[str]]:
+    return {"status": "ok", **get_onnxruntime_provider_info()}
 
 
 @app.get("/models")
