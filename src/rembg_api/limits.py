@@ -16,6 +16,10 @@ class InvalidImageError(ValueError):
     """Malformed client-supplied image bytes."""
 
 
+class InvalidOutputImageError(RuntimeError):
+    """Malformed image bytes produced by a backend or postprocessing stage."""
+
+
 class EncodedImageTooLarge(ImageLimitError):
     """An encoder attempted to exceed its configured output byte limit."""
 
@@ -100,8 +104,14 @@ def max_request_bytes_from_env() -> int:
     return max_request_bytes
 
 
-def validate_image_bytes(data: bytes, limits: ImageLimits, *, subject: str) -> tuple[int, int]:
-    """Bound dimensions, then fully validate client image data before model work."""
+def _validate_image_bytes(
+    data: bytes,
+    limits: ImageLimits,
+    *,
+    subject: str,
+    invalid_error: type[ValueError] | type[RuntimeError],
+) -> tuple[int, int]:
+    """Bound dimensions, then fully decode image data for the specified stage."""
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
@@ -119,4 +129,22 @@ def validate_image_bytes(data: bytes, limits: ImageLimits, *, subject: str) -> t
     except (UnidentifiedImageError, OSError, ValueError) as exc:
         if isinstance(exc, ImageLimitError):
             raise
-        raise InvalidImageError(f"{subject} bytes are not a valid image") from exc
+        raise invalid_error(f"{subject} bytes are not a valid image") from exc
+
+
+def validate_image_bytes(
+    data: bytes, limits: ImageLimits, *, subject: str
+) -> tuple[int, int]:
+    """Fully validate caller-supplied image bytes before model work."""
+    return _validate_image_bytes(
+        data, limits, subject=subject, invalid_error=InvalidImageError
+    )
+
+
+def validate_output_image_bytes(
+    data: bytes, limits: ImageLimits, *, subject: str = "output"
+) -> tuple[int, int]:
+    """Fully validate backend/postprocessing image bytes as internal output."""
+    return _validate_image_bytes(
+        data, limits, subject=subject, invalid_error=InvalidOutputImageError
+    )

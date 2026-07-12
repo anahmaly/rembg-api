@@ -302,6 +302,54 @@ def test_truncated_png_returns_safe_400_before_backend(monkeypatch) -> None:
     assert response.json() == {"detail": "Uploaded file is not a valid image"}
 
 
+def test_corrupt_rembg_backend_output_returns_generic_500(monkeypatch) -> None:
+    monkeypatch.setattr(main, "new_session", lambda model: object())
+    monkeypatch.setattr(main, "remove", lambda *args, **kwargs: b"corrupt rembg output")
+    main.get_session.cache_clear()
+
+    from fastapi.testclient import TestClient
+
+    response = TestClient(main.app).post(
+        "/remove-background/?model=u2net",
+        files={"file": ("valid.png", make_png(), "image/png")},
+    )
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Internal image processing error"}
+    assert "corrupt rembg output" not in response.text
+
+
+def test_corrupt_birefnet_backend_output_returns_generic_500(monkeypatch) -> None:
+    config = BiRefNetConfig(
+        source="/models/test",
+        revision=DEFAULT_REVISION,
+        local_files_only=True,
+        trust_remote_code=True,
+        cache_dir=None,
+        device="cpu",
+        precision="fp32",
+        inference_size=512,
+        foreground_refinement=False,
+        max_concurrency=1,
+    )
+    main._birefnet_admissions.clear()
+    monkeypatch.setattr(main.BiRefNetConfig, "from_env", lambda: config)
+    monkeypatch.setattr(
+        main, "remove_with_birefnet", lambda *args, **kwargs: b"corrupt birefnet output"
+    )
+
+    from fastapi.testclient import TestClient
+
+    response = TestClient(main.app).post(
+        "/remove-background/?model=birefnet-hr-matting",
+        files={"file": ("valid.png", make_png(), "image/png")},
+    )
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Internal image processing error"}
+    assert "corrupt birefnet output" not in response.text
+
+
 def test_lazy_chunked_upload_is_rejected_at_actual_byte_limit() -> None:
     class Upload:
         def __init__(self) -> None:

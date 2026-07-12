@@ -44,6 +44,7 @@ from rembg_api.limits import (
     max_upload_bytes_from_env,
     output_limits_from_env,
     validate_image_bytes,
+    validate_output_image_bytes,
 )
 
 logger = logging.getLogger(__name__)
@@ -432,9 +433,10 @@ async def remove_background(
                         input_limits=input_limits,
                         output_limits=output_limits,
                     )
-                    validate_image_bytes(removed, output_limits, subject="output")
+                    validate_output_image_bytes(removed, output_limits)
                     encoded = process(removed)
                     output_limits.validate_encoded_bytes(len(encoded), subject="output")
+                    validate_output_image_bytes(encoded, output_limits)
                     return encoded
                 finally:
                     worker_admission.release()
@@ -473,9 +475,10 @@ async def remove_background(
                 raise RuntimeError(
                     f"background removal returned {type(removed)!r}, expected bytes"
                 )
-            validate_image_bytes(removed, output_limits, subject="output")
+            validate_output_image_bytes(removed, output_limits)
             output_bytes = process(removed)
             output_limits.validate_encoded_bytes(len(output_bytes), subject="output")
+            validate_output_image_bytes(output_bytes, output_limits)
         return Response(content=output_bytes, media_type="image/png")
     except HTTPException:
         raise
