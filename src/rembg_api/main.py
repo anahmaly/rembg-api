@@ -21,11 +21,17 @@ from rembg_api.bria_rmbg import (
     remove_with_bria_rmbg_2,
     should_release_cuda_cache_after_request,
 )
+from rembg_api.birefnet_hr import (
+    BIREFNET_MODEL_NAME,
+    clear_cache as clear_birefnet_cache,
+    health_info as birefnet_health_info,
+    remove_with_birefnet,
+)
 from rembg_api.image_processing import AlphaOptions, DespillOptions, process_png_bytes
 
 logger = logging.getLogger(__name__)
 
-SupportedModel = Literal["isnet-general-use", "u2net", "u2netp", "isnet-anime", "silueta", "bria-rmbg-2.0"]
+SupportedModel = Literal["isnet-general-use", "u2net", "u2netp", "isnet-anime", "silueta", "bria-rmbg-2.0", "birefnet-hr-matting"]
 OutputFormat = Literal["png"]
 BackgroundColor = Literal["transparent", "white", "black", "custom"]
 DespillColor = Literal["black", "white", "green", "blue", "custom"]
@@ -37,7 +43,7 @@ REMBG_MODELS: tuple[str, ...] = (
     "isnet-anime",
     "silueta",
 )
-SUPPORTED_MODELS: tuple[str, ...] = (*REMBG_MODELS, BRIA_RMBG_2_MODEL_ID)
+SUPPORTED_MODELS: tuple[str, ...] = (*REMBG_MODELS, BRIA_RMBG_2_MODEL_ID, BIREFNET_MODEL_NAME)
 
 app = FastAPI(
     title="rembg-api",
@@ -85,6 +91,7 @@ def health() -> dict[str, object]:
         "status": "ok",
         **get_onnxruntime_provider_info(),
         "bria_rmbg_2": get_bria_model_info(),
+        "birefnet_hr_matting": birefnet_health_info(),
     }
 
 
@@ -98,7 +105,8 @@ def models() -> dict[str, object]:
                 "backend": "torch-transformers-local",
                 "configured_path": configured_model_path(),
                 **get_bria_model_info(),
-            }
+            },
+            BIREFNET_MODEL_NAME: {"backend": "torch-transformers", **birefnet_health_info()},
         },
     }
 
@@ -113,7 +121,8 @@ def clear_caches(
     """Clear cached rembg sessions and BRIA backends for LAN-local resource recovery."""
     get_session.cache_clear()
     clear_bria_backend_cache(release_cuda_cache=release_cuda_cache)
-    return {"status": "ok", "rembg_sessions_cleared": True, "bria_backends_cleared": True}
+    clear_birefnet_cache()
+    return {"status": "ok", "rembg_sessions_cleared": True, "bria_backends_cleared": True, "birefnet_backends_cleared": True}
 
 
 @app.post(
@@ -159,6 +168,8 @@ async def remove_background(
             )
         ),
     ] = None,
+    birefnet_inference_size: Annotated[int | None, Query(ge=512, le=4096, description="BiRefNet square input size; env/default is 2048")] = None,
+    birefnet_foreground_refinement: Annotated[bool | None, Query(description="BiRefNet only: clear hidden RGB for fully transparent pixels; alpha is unchanged")] = None,
 ) -> Response:
     if output_format != "png":
         raise HTTPException(status_code=400, detail="Only png output_format is supported")
@@ -173,7 +184,13 @@ async def remove_background(
     )
 
     try:
-        if bria_request:
+        if model == BIREFNET_MODEL_NAME:
+            removed = remove_with_birefnet(
+                input_bytes,
+                inference_size=birefnet_inference_size,
+                foreground_refinement=birefnet_foreground_refinement,
+            )
+        elif bria_request:
             removed = remove_with_bria_rmbg_2(
                 input_bytes,
                 model_input_size=model_input_size,

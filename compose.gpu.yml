@@ -8,8 +8,18 @@ services:
     environment:
       - OMP_NUM_THREADS=1
       - BRIA_RMBG_2_MODEL_PATH=/models/briaai/RMBG-2.0
+      - BIREFNET_MODEL_PATH=/models/ZhengPeng7/BiRefNet_HR-matting
+      - BIREFNET_REVISION=5d6b6f8adcb5b417c871b1d84ceaae9871355b7f
+      - BIREFNET_LOCAL_FILES_ONLY=true
+      - BIREFNET_TRUST_REMOTE_CODE=true
+      - BIREFNET_DEVICE=cuda
+      - BIREFNET_PRECISION=fp16
+      - BIREFNET_MAX_CONCURRENCY=1
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
     volumes:
       - ${HOME}/models/briaai/RMBG-2.0:/models/briaai/RMBG-2.0:ro
+      - ${HOME}/models/ZhengPeng7/BiRefNet_HR-matting:/models/ZhengPeng7/BiRefNet_HR-matting:ro
       - rembg-model-cache:/root/.u2net
     gpus: all
 

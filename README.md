@@ -284,4 +284,59 @@ pytest -q
 git diff --check
 ```
 
-Tests monkeypatch `rembg.new_session`, `rembg.remove`, ONNX Runtime provider discovery, and the BRIA RMBG-2.0 local backend so they do not download models or require GPU/model weights.
+Tests monkeypatch `rembg.new_session`, `rembg.remove`, ONNX Runtime provider discovery, and the BRIA/BiRefNet local backends so they do not download models or require GPU/model weights.
+
+## BiRefNet HR matting
+
+Select `model=birefnet-hr-matting` to use [ZhengPeng7/BiRefNet_HR-matting](https://huggingface.co/ZhengPeng7/BiRefNet_HR-matting) (MIT). The service pins revision `5d6b6f8adcb5b417c871b1d84ceaae9871355b7f`. Native preprocessing is RGB, square resize (2048 by default), tensor conversion, and ImageNet normalization. The final `model(tensor)[-1].sigmoid()` alpha is clamped, validated, and resized to the exact original dimensions before an RGBA PNG is emitted.
+
+### Recommended offline production setup
+
+Download the pinned snapshot outside the service image (this is an explicit operator/bootstrap step, not an application startup action):
+
+```bash
+huggingface-cli download ZhengPeng7/BiRefNet_HR-matting \
+  --revision 5d6b6f8adcb5b417c871b1d84ceaae9871355b7f \
+  --local-dir "$HOME/models/ZhengPeng7/BiRefNet_HR-matting"
+```
+
+Review the pinned remote Python code before enabling it, then mount it read-only. The compose files provide the exact mount and offline variables. `trust_remote_code` is required by this model even from a local snapshot, so the application default is deliberately `false`; compose opts in for the reviewed pinned mount.
+
+```bash
+export BIREFNET_MODEL_PATH=/models/ZhengPeng7/BiRefNet_HR-matting
+export BIREFNET_REVISION=5d6b6f8adcb5b417c871b1d84ceaae9871355b7f
+export BIREFNET_LOCAL_FILES_ONLY=true
+export BIREFNET_TRUST_REMOTE_CODE=true
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+
+docker compose up --build rembg-api                    # CPU / fp32
+docker compose -f compose.gpu.yml up --build           # CUDA / fp16
+```
+
+The default cache key includes effective source, revision, offline/trust policy, cache directory, resolved device, resolved precision, and concurrency. Loading is lazy and concurrency-safe; no model is loaded by startup, `/health`, or `/models`. GPU inference defaults to one concurrent call to avoid overlapping roughly 444 MB of weights plus provisional multi-GB 2048px activation/working memory. Actual VRAM and image quality are not guaranteed until evaluated on the target GPU; lower `BIREFNET_INFERENCE_SIZE` or keep `BIREFNET_MAX_CONCURRENCY=1` after OOM.
+
+```bash
+curl -sS -X POST \
+  'http://localhost:8001/remove-background/?model=birefnet-hr-matting&birefnet_inference_size=2048' \
+  -F 'file=@input.png' --output output.png
+```
+
+`birefnet_foreground_refinement=false` (default) preserves the original RGB and changes only alpha. When true, the conservative refinement clears hidden RGB only where alpha is fully transparent; it does not alter alpha or visible foreground colors. `/health` reports only the configured source basename, pinned revision, effective device/precision, CUDA availability, readiness, and loaded state—never the full local path and never by loading/downloading weights.
+
+Configuration variables:
+
+| Variable | Safe default | Meaning |
+| --- | --- | --- |
+| `BIREFNET_MODEL_PATH` | `/models/ZhengPeng7/BiRefNet_HR-matting` | Absolute read-only offline snapshot path. |
+| `BIREFNET_MODEL_ID` | `ZhengPeng7/BiRefNet_HR-matting` | Used only when offline mode is explicitly disabled. |
+| `BIREFNET_REVISION` | pinned SHA above | Model/custom-code revision. |
+| `BIREFNET_LOCAL_FILES_ONLY` | `true` | Prevent Hugging Face network access. |
+| `BIREFNET_TRUST_REMOTE_CODE` | `false` | Must be explicitly enabled after reviewing pinned code. |
+| `BIREFNET_DEVICE` | `auto` | `auto`, `cuda`, or `cpu`. |
+| `BIREFNET_PRECISION` | `auto` | fp16 on CUDA, fp32 on CPU; CPU fp16 is rejected. |
+| `BIREFNET_INFERENCE_SIZE` | `2048` | Square preprocessing size, 512–4096. |
+| `BIREFNET_FOREGROUND_REFINEMENT` | `false` | Optional hidden-RGB cleanup described above. |
+| `BIREFNET_CACHE_DIR` | unset | Optional Hugging Face cache location. |
+| `BIREFNET_MAX_CONCURRENCY` | `1` | Per-loaded-backend bounded inference concurrency. |
+
+Online bootstrap is intentionally opt-in and executes downloaded custom code: set `BIREFNET_LOCAL_FILES_ONLY=false`, `BIREFNET_TRUST_REMOTE_CODE=true`, and optionally `BIREFNET_MODEL_ID`. Do not use that mode for drift-resistant production. If readiness is false, verify the mount, permissions, exact revision snapshot, and trust flag. A generic API 500 protects operator details; inspect server logs for the safe failure category.

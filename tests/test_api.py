@@ -29,6 +29,7 @@ def test_health(monkeypatch) -> None:
         lambda: ["CPUExecutionProvider"],
     )
     monkeypatch.setattr(main, "get_bria_model_info", lambda: {"model_path_available": False})
+    monkeypatch.setattr(main, "birefnet_health_info", lambda: {"loaded": False})
     client = TestClient(main.app)
     response = client.get("/health")
     assert response.status_code == 200
@@ -38,6 +39,7 @@ def test_health(monkeypatch) -> None:
         "preferred_provider": "CPUExecutionProvider",
         "gpu_available": False,
         "bria_rmbg_2": {"model_path_available": False},
+        "birefnet_hr_matting": {"loaded": False},
     }
 
 
@@ -48,6 +50,7 @@ def test_health_reports_cuda_provider_when_available(monkeypatch) -> None:
         lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"],
     )
     monkeypatch.setattr(main, "get_bria_model_info", lambda: {"model_path_available": True})
+    monkeypatch.setattr(main, "birefnet_health_info", lambda: {"loaded": False})
     client = TestClient(main.app)
     response = client.get("/health")
     assert response.status_code == 200
@@ -57,11 +60,13 @@ def test_health_reports_cuda_provider_when_available(monkeypatch) -> None:
         "preferred_provider": "CUDAExecutionProvider",
         "gpu_available": True,
         "bria_rmbg_2": {"model_path_available": True},
+        "birefnet_hr_matting": {"loaded": False},
     }
 
 
 def test_models_lists_supported_default(monkeypatch) -> None:
     monkeypatch.setattr(main, "get_bria_model_info", lambda: {"model_path_available": False})
+    monkeypatch.setattr(main, "birefnet_health_info", lambda: {"loaded": False})
     client = TestClient(main.app)
     response = client.get("/models")
     assert response.status_code == 200
@@ -93,6 +98,7 @@ def test_cache_clear_endpoint_clears_rembg_and_bria_caches(monkeypatch) -> None:
         "status": "ok",
         "rembg_sessions_cleared": True,
         "bria_backends_cleared": True,
+        "birefnet_backends_cleared": True,
     }
     assert main.get_session.cache_info().currsize == 0
     assert calls["release_cuda_cache"] is False
