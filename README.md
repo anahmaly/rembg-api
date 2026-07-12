@@ -7,10 +7,11 @@ Thin FastAPI bytes-in/bytes-out wrapper around [`rembg`](https://github.com/dani
 - `POST /remove-background/` accepts multipart image bytes in a `file` field.
 - The response is PNG bytes (`Content-Type: image/png`).
 - Normal requests do not require temporary filesystem files; input and output are handled as bytes in process.
-- OpenAPI docs are available from FastAPI at `/docs` and `/openapi.json`.
+- OpenAPI docs are available from FastAPI at `/docs` and `/openapi.json`; `/remove-background/` documents `413` size-limit and `429` BiRefNet-capacity responses.
+- Request and image limits are applied before expensive image work; the defaults are intentionally finite and configurable below.
 - `GET /health` reports ONNX Runtime provider availability plus BRIA RMBG-2.0 torch/CUDA, CUDA memory stats, and local-path status without downloading weights.
 - `GET /models` lists supported model IDs and whether the configured BRIA RMBG-2.0 path is present/readable.
-- `POST /cache/clear` clears cached rembg sessions and BRIA RMBG-2.0 backends, then runs Python/CUDA cleanup for LAN-local resource recovery.
+- `POST /cache/clear` clears cached rembg, BRIA RMBG-2.0, and BiRefNet backends, then reports whether optional CUDA allocator cleanup actually ran.
 
 ## Run locally
 
@@ -156,7 +157,7 @@ Returns the default model, supported model names, and BRIA RMBG-2.0 configured l
 
 ### `POST /cache/clear`
 
-Clears cached rembg sessions and BRIA RMBG-2.0 cached backends, runs `gc.collect()`, and calls `torch.cuda.empty_cache()` by default when CUDA is available. The service has no built-in auth, so keep it LAN-local or behind your own trusted network boundary.
+Clears cached rembg sessions plus BRIA RMBG-2.0 and BiRefNet backends, then runs `gc.collect()`. With `release_cuda_cache=true` (the default), `torch.cuda.empty_cache()` runs only when a torch backend was loaded and CUDA is available; clearing an unused service does not import or load torch/models. The response reports both `cuda_cache_release_requested` and `cuda_cache_released`. The service has no built-in auth, so keep it LAN-local or behind your own trusted network boundary.
 
 ```bash
 curl -sS -X POST "http://localhost:8001/cache/clear"
@@ -244,6 +245,24 @@ curl -sS -X POST "http://localhost:8001/remove-background/?return_checker_previe
 
 If both `return_alpha` and `return_checker_preview` are true, `return_alpha` takes precedence.
 
+## Request and image limits
+
+The service applies these process-wide bounds to every `/remove-background/` request. A route-scoped ASGI guard rejects a declared multipart `Content-Length` over `REMBG_MAX_REQUEST_BYTES` before consuming the body and counts every actual `http.request` chunk while Starlette parses/spools multipart data. The whole envelope is therefore bounded even without a length header, including framing, ignored form parts, and the selected file; parsing may occur before BiRefNet admission, but only inside this finite request-byte bound. Malformed or negative declared lengths return `400`. This is deliberately separate from `REMBG_MAX_UPLOAD_BYTES`: multipart framing means total request bytes are not the same as the selected file's bytes. After parsing, BiRefNet saturation is rejected before the selected upload is read or decoded. The selected file is always read in 64 KiB chunks and stops at the exact file limit. Image dimensions are checked before pixel decode, corrupt/truncated client images return a safe `400`, and output dimensions are checked before BiRefNet alpha resizing/RGBA allocation and again before postprocessing. Final PNG encoding writes through a capped in-memory stream that raises `413` before its buffer can grow beyond `REMBG_MAX_OUTPUT_BYTES`.
+
+| Variable | Default | Scope |
+| --- | --- | --- |
+| `REMBG_MAX_REQUEST_BYTES` | `21000000` | Whole HTTP request body, including multipart framing. Must be at least `REMBG_MAX_UPLOAD_BYTES`; the default leaves 1 MB for normal multipart overhead. |
+| `REMBG_MAX_UPLOAD_BYTES` | `20000000` | Input file bytes read from multipart upload. |
+| `REMBG_MAX_INPUT_WIDTH` | `10000` | Decoded source-image width. |
+| `REMBG_MAX_INPUT_HEIGHT` | `10000` | Decoded source-image height. |
+| `REMBG_MAX_INPUT_PIXELS` | `40000000` | Decoded source-image pixels. Pillow decompression-bomb warnings/errors are treated as a safe rejection. |
+| `REMBG_MAX_OUTPUT_WIDTH` | `10000` | Decoded model-output width. |
+| `REMBG_MAX_OUTPUT_HEIGHT` | `10000` | Decoded model-output height. |
+| `REMBG_MAX_OUTPUT_PIXELS` | `40000000` | Decoded model-output pixels. |
+| `REMBG_MAX_OUTPUT_BYTES` | `40000000` | Final encoded PNG response bytes. |
+
+Limit rejections use `413` and a generic message; invalid request bodies continue to use normal `400`/`422` responses. For BiRefNet, admission has no wait queue: a request that cannot immediately reserve capacity returns `429`, so queued or cancelled clients cannot accumulate background workers.
+
 ## Runtime notes
 
 - First request per rembg model may download weights/cache the model before inference begins.
@@ -284,4 +303,61 @@ pytest -q
 git diff --check
 ```
 
-Tests monkeypatch `rembg.new_session`, `rembg.remove`, ONNX Runtime provider discovery, and the BRIA RMBG-2.0 local backend so they do not download models or require GPU/model weights.
+Tests monkeypatch `rembg.new_session`, `rembg.remove`, ONNX Runtime provider discovery, and the BRIA/BiRefNet local backends so they do not download models or require GPU/model weights.
+
+## BiRefNet HR matting
+
+Select `model=birefnet-hr-matting` to use [ZhengPeng7/BiRefNet_HR-matting](https://huggingface.co/ZhengPeng7/BiRefNet_HR-matting) (MIT). The service pins revision `5d6b6f8adcb5b417c871b1d84ceaae9871355b7f`. Native preprocessing is RGB, square resize (2048 by default), tensor conversion, and ImageNet normalization. The final `model(tensor)[-1].sigmoid()` alpha is clamped, validated, and resized to the exact original dimensions before an RGBA PNG is emitted.
+
+### Recommended offline production setup
+
+Download the pinned snapshot outside the service image (this is an explicit operator/bootstrap step, not an application startup action):
+
+```bash
+huggingface-cli download ZhengPeng7/BiRefNet_HR-matting \
+  --revision 5d6b6f8adcb5b417c871b1d84ceaae9871355b7f \
+  --local-dir "$HOME/models/ZhengPeng7/BiRefNet_HR-matting"
+```
+
+Review the pinned remote Python code before enabling it, then mount it read-only. The compose files provide the exact mount and offline variables. `trust_remote_code` is required by this model even from a local snapshot, so the application default is deliberately `false`; compose opts in for the reviewed pinned mount.
+
+```bash
+export BIREFNET_MODEL_PATH=/models/ZhengPeng7/BiRefNet_HR-matting
+export BIREFNET_REVISION=5d6b6f8adcb5b417c871b1d84ceaae9871355b7f
+export BIREFNET_LOCAL_FILES_ONLY=true
+export BIREFNET_TRUST_REMOTE_CODE=true
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+
+docker compose up --build rembg-api                    # CPU / fp32
+docker compose -f compose.gpu.yml up --build           # CUDA / fp16
+```
+
+The default cache key includes effective source, revision, offline/trust policy, cache directory, resolved device, resolved precision, and concurrency. Loading is lazy and concurrency-safe; no model is loaded by startup, `/health`, or `/models`. GPU inference defaults to one concurrent call to avoid overlapping roughly 444 MB of weights plus provisional multi-GB 2048px activation/working memory. Actual VRAM and image quality are not guaranteed until evaluated on the target GPU; lower `BIREFNET_INFERENCE_SIZE` if memory is constrained.
+
+BiRefNet admission is process-wide and immediate: `BIREFNET_MAX_CONCURRENCY` reserves a slot before endpoint file reading and holds it through worker-thread model loading, header decode, preprocessing, inference, postprocessing, and encoding. There is deliberately no admission wait queue; a saturated request receives seller-safe `429` and does no BiRefNet preprocessing. If a client disconnects or its request task is cancelled after admission, response waiting stops promptly while the already-admitted worker keeps its reservation until it genuinely exits. This bounded task handoff prevents cancellation storms from accumulating abandoned workers; `/health` remains event-loop responsive and capacity recovers when the worker finishes.
+
+```bash
+curl -sS -X POST \
+  'http://localhost:8001/remove-background/?model=birefnet-hr-matting&birefnet_inference_size=2048' \
+  -F 'file=@input.png' --output output.png
+```
+
+`birefnet_foreground_refinement=false` (default) preserves the original RGB and changes only alpha. When true, the conservative refinement clears hidden RGB only where alpha is fully transparent; it does not alter alpha or visible foreground colors. `/health` reports only the configured source basename, pinned revision, effective device/precision, CUDA availability, readiness, and loaded state—never the full local path and never by loading/downloading weights.
+
+Configuration variables:
+
+| Variable | Safe default | Meaning |
+| --- | --- | --- |
+| `BIREFNET_MODEL_PATH` | `/models/ZhengPeng7/BiRefNet_HR-matting` | Absolute read-only offline snapshot path. |
+| `BIREFNET_MODEL_ID` | `ZhengPeng7/BiRefNet_HR-matting` | Used only when offline mode is explicitly disabled. |
+| `BIREFNET_REVISION` | pinned SHA above | Model/custom-code revision. |
+| `BIREFNET_LOCAL_FILES_ONLY` | `true` | Prevent Hugging Face network access. |
+| `BIREFNET_TRUST_REMOTE_CODE` | `false` | Must be explicitly enabled after reviewing pinned code. |
+| `BIREFNET_DEVICE` | `auto` | `auto`, `cuda`, or `cpu`. |
+| `BIREFNET_PRECISION` | `auto` | fp16 on CUDA, fp32 on CPU; CPU fp16 is rejected. |
+| `BIREFNET_INFERENCE_SIZE` | `2048` | Square preprocessing size, 512–4096. |
+| `BIREFNET_FOREGROUND_REFINEMENT` | `false` | Optional hidden-RGB cleanup described above. |
+| `BIREFNET_CACHE_DIR` | unset | Optional Hugging Face cache location. |
+| `BIREFNET_MAX_CONCURRENCY` | `1` | Per-loaded-backend bounded inference concurrency. |
+
+Online bootstrap is intentionally opt-in and executes downloaded custom code: set `BIREFNET_LOCAL_FILES_ONLY=false`, `BIREFNET_TRUST_REMOTE_CODE=true`, and optionally `BIREFNET_MODEL_ID`. Do not use that mode for drift-resistant production. If readiness is false, verify the mount, permissions, exact revision snapshot, and trust flag. A generic API 500 protects operator details; inspect server logs for the safe failure category.

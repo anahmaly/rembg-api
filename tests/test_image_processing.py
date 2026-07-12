@@ -53,6 +53,7 @@ def test_process_png_bytes_can_return_alpha_mask() -> None:
         return_alpha=True,
         return_checker_preview=False,
         checker_size=8,
+        max_encoded_bytes=1_000_000,
     )
 
     image = read_image(output)
@@ -70,6 +71,7 @@ def test_process_png_bytes_checker_preview_is_opaque() -> None:
         return_alpha=False,
         return_checker_preview=True,
         checker_size=2,
+        max_encoded_bytes=1_000_000,
     )
 
     image = read_image(output).convert("RGBA")

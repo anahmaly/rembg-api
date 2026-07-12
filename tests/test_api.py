@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 from rembg_api import main
@@ -28,7 +29,10 @@ def test_health(monkeypatch) -> None:
         "get_available_providers",
         lambda: ["CPUExecutionProvider"],
     )
-    monkeypatch.setattr(main, "get_bria_model_info", lambda: {"model_path_available": False})
+    monkeypatch.setattr(
+        main, "get_bria_model_info", lambda: {"model_path_available": False}
+    )
+    monkeypatch.setattr(main, "birefnet_health_info", lambda: {"loaded": False})
     client = TestClient(main.app)
     response = client.get("/health")
     assert response.status_code == 200
@@ -38,6 +42,7 @@ def test_health(monkeypatch) -> None:
         "preferred_provider": "CPUExecutionProvider",
         "gpu_available": False,
         "bria_rmbg_2": {"model_path_available": False},
+        "birefnet_hr_matting": {"loaded": False},
     }
 
 
@@ -47,21 +52,31 @@ def test_health_reports_cuda_provider_when_available(monkeypatch) -> None:
         "get_available_providers",
         lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"],
     )
-    monkeypatch.setattr(main, "get_bria_model_info", lambda: {"model_path_available": True})
+    monkeypatch.setattr(
+        main, "get_bria_model_info", lambda: {"model_path_available": True}
+    )
+    monkeypatch.setattr(main, "birefnet_health_info", lambda: {"loaded": False})
     client = TestClient(main.app)
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json() == {
         "status": "ok",
-        "onnxruntime_available_providers": ["CUDAExecutionProvider", "CPUExecutionProvider"],
+        "onnxruntime_available_providers": [
+            "CUDAExecutionProvider",
+            "CPUExecutionProvider",
+        ],
         "preferred_provider": "CUDAExecutionProvider",
         "gpu_available": True,
         "bria_rmbg_2": {"model_path_available": True},
+        "birefnet_hr_matting": {"loaded": False},
     }
 
 
 def test_models_lists_supported_default(monkeypatch) -> None:
-    monkeypatch.setattr(main, "get_bria_model_info", lambda: {"model_path_available": False})
+    monkeypatch.setattr(
+        main, "get_bria_model_info", lambda: {"model_path_available": False}
+    )
+    monkeypatch.setattr(main, "birefnet_health_info", lambda: {"loaded": False})
     client = TestClient(main.app)
     response = client.get("/models")
     assert response.status_code == 200
@@ -93,9 +108,70 @@ def test_cache_clear_endpoint_clears_rembg_and_bria_caches(monkeypatch) -> None:
         "status": "ok",
         "rembg_sessions_cleared": True,
         "bria_backends_cleared": True,
+        "birefnet_backends_cleared": True,
+        "cuda_cache_release_requested": False,
+        "cuda_cache_released": False,
     }
     assert main.get_session.cache_info().currsize == 0
     assert calls["release_cuda_cache"] is False
+
+
+def test_cache_clear_cuda_reporting_and_no_load_behavior(monkeypatch) -> None:
+    calls: list[str] = []
+
+    class CacheInfo:
+        currsize = 0
+
+    def fake_bria_backend():
+        raise AssertionError("backend must not load")
+
+    fake_bria_backend.cache_info = lambda: CacheInfo()  # type: ignore[attr-defined]
+    monkeypatch.setattr(main, "get_bria_rmbg_2_backend", fake_bria_backend)
+    monkeypatch.setattr(main, "clear_bria_backend_cache", lambda **kwargs: None)
+    monkeypatch.setattr(main, "clear_birefnet_cache", lambda: 0)
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: calls.append("checked") or True,
+            empty_cache=lambda: calls.append("released"),
+        )
+    )
+    monkeypatch.setitem(__import__("sys").modules, "torch", fake_torch)
+    result = main.clear_caches(release_cuda_cache=True)
+    assert result["cuda_cache_release_requested"] is True
+    assert result["cuda_cache_released"] is False
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("requested", "available", "expected"),
+    [(False, True, False), (True, False, False), (True, True, True)],
+)
+def test_cache_clear_cuda_release_outcomes(
+    monkeypatch, requested, available, expected
+) -> None:
+    calls: list[str] = []
+
+    class CacheInfo:
+        currsize = 0
+
+    def fake_bria_backend():
+        raise AssertionError("backend must not load")
+
+    fake_bria_backend.cache_info = lambda: CacheInfo()  # type: ignore[attr-defined]
+    monkeypatch.setattr(main, "get_bria_rmbg_2_backend", fake_bria_backend)
+    monkeypatch.setattr(main, "clear_bria_backend_cache", lambda **kwargs: None)
+    monkeypatch.setattr(main, "clear_birefnet_cache", lambda: 1)
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: available,
+            empty_cache=lambda: calls.append("released"),
+        )
+    )
+    monkeypatch.setitem(__import__("sys").modules, "torch", fake_torch)
+    result = main.clear_caches(release_cuda_cache=requested)
+    assert result["cuda_cache_release_requested"] is requested
+    assert result["cuda_cache_released"] is expected
+    assert calls == (["released"] if expected else [])
 
 
 def test_remove_background_bytes_in_bytes_out(monkeypatch) -> None:
@@ -173,7 +249,9 @@ def test_bria_release_cuda_cache_query_override(monkeypatch) -> None:
     monkeypatch.setattr(
         main,
         "release_request_memory",
-        lambda *, release_cuda_cache: calls.setdefault("release_cuda_cache", release_cuda_cache),
+        lambda *, release_cuda_cache: calls.setdefault(
+            "release_cuda_cache", release_cuda_cache
+        ),
     )
 
     client = TestClient(main.app)
@@ -208,20 +286,31 @@ def test_bria_remove_releases_request_memory_with_env_default(monkeypatch) -> No
             return b"png"
 
     monkeypatch.setenv("BRIA_RELEASE_CUDA_CACHE_AFTER_REQUEST", "false")
-    monkeypatch.setattr(bria_rmbg, "resolve_bria_backend_cache_key", lambda path, device, dtype: (path, "cuda", "fp16"))
-    monkeypatch.setattr(bria_rmbg, "get_bria_rmbg_2_backend", lambda *key: FakeBackend())
+    monkeypatch.setattr(
+        bria_rmbg,
+        "resolve_bria_backend_cache_key",
+        lambda path, device, dtype: (path, "cuda", "fp16"),
+    )
+    monkeypatch.setattr(
+        bria_rmbg, "get_bria_rmbg_2_backend", lambda *key: FakeBackend()
+    )
     monkeypatch.setattr(
         bria_rmbg,
         "release_request_memory",
-        lambda *, release_cuda_cache: calls.setdefault("release_cuda_cache", release_cuda_cache),
+        lambda *, release_cuda_cache: calls.setdefault(
+            "release_cuda_cache", release_cuda_cache
+        ),
     )
 
-    assert bria_rmbg.remove_with_bria_rmbg_2(
-        b"input",
-        model_input_size=1024,
-        device="auto",
-        dtype="auto",
-    ) == b"png"
+    assert (
+        bria_rmbg.remove_with_bria_rmbg_2(
+            b"input",
+            model_input_size=1024,
+            device="auto",
+            dtype="auto",
+        )
+        == b"png"
+    )
 
     assert calls == {
         "data": b"input",
@@ -334,13 +423,17 @@ def test_bria_preprocess_normalization_matches_model_card() -> None:
     assert BRIA_RMBG_2_NORMALIZE_STD == (0.229, 0.224, 0.225)
 
 
-def test_bria_runtime_dependency_check_reports_missing_timm_and_kornia(monkeypatch) -> None:
+def test_bria_runtime_dependency_check_reports_missing_timm_and_kornia(
+    monkeypatch,
+) -> None:
     def fake_import_module(name: str):
         if name in {"timm", "kornia"}:
             raise ModuleNotFoundError(f"No module named {name!r}", name=name)
         return object()
 
-    monkeypatch.setattr("rembg_api.bria_rmbg.importlib.import_module", fake_import_module)
+    monkeypatch.setattr(
+        "rembg_api.bria_rmbg.importlib.import_module", fake_import_module
+    )
 
     try:
         _check_bria_runtime_dependencies()
@@ -359,7 +452,9 @@ def test_bria_required_runtime_modules_include_custom_code_dependencies() -> Non
     )
 
 
-def test_bria_backend_failure_returns_generic_500_and_logs_exact_error(monkeypatch, caplog) -> None:
+def test_bria_backend_failure_returns_generic_500_and_logs_exact_error(
+    monkeypatch, caplog
+) -> None:
     def fail_bria_remove(data: bytes, **kwargs) -> bytes:
         raise FileNotFoundError("exact missing /models/briaai/RMBG-2.0")
 
