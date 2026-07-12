@@ -10,8 +10,8 @@ from typing import Annotated, Literal
 
 from anyio import to_thread
 
-from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
-from fastapi.responses import Response
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi.responses import JSONResponse, Response
 import onnxruntime as ort
 from rembg import new_session, remove
 
@@ -38,6 +38,7 @@ from rembg_api.birefnet_hr import (
 from rembg_api.image_processing import AlphaOptions, DespillOptions, process_png_bytes
 from rembg_api.limits import (
     ImageLimitError,
+    InvalidImageError,
     input_limits_from_env,
     max_request_bytes_from_env,
     max_upload_bytes_from_env,
@@ -46,6 +47,70 @@ from rembg_api.limits import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _RequestBodyTooLarge(BaseException):
+    """Escape multipart parsing without being rewritten as a malformed form."""
+
+
+class RequestBodyLimitMiddleware:
+    """Bound every byte consumed for upload endpoints, including multipart overhead."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http" or scope["path"] != "/remove-background/":
+            await self.app(scope, receive, send)
+            return
+
+        max_bytes = max_request_bytes_from_env()
+        headers = {key.lower(): value for key, value in scope.get("headers", [])}
+        declared = headers.get(b"content-length")
+        if declared is not None:
+            if not declared or any(byte < ord("0") or byte > ord("9") for byte in declared):
+                await JSONResponse(
+                    status_code=400, content={"detail": "Invalid Content-Length header"}
+                )(scope, receive, send)
+                return
+            declared_size = int(declared)
+            if declared_size > max_bytes:
+                await JSONResponse(
+                    status_code=413,
+                    content={"detail": "Request body is larger than this service accepts"},
+                )(scope, receive, send)
+                return
+
+        consumed = 0
+        response_started = False
+
+        async def limited_receive():
+            nonlocal consumed
+            message = await receive()
+            if message["type"] == "http.request":
+                consumed += len(message.get("body", b""))
+                if consumed > max_bytes:
+                    raise _RequestBodyTooLarge
+            return message
+
+        async def tracked_send(message) -> None:
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, tracked_send)
+        except _RequestBodyTooLarge:
+            if response_started:
+                # Multipart parsing completes before this route starts a response;
+                # guard anyway so a future streaming route cannot double-send.
+                raise RuntimeError("request limit exceeded after response start")
+            await JSONResponse(
+                status_code=413,
+                content={"detail": "Request body is larger than this service accepts"},
+            )(scope, receive, send)
+
 
 SupportedModel = Literal[
     "isnet-general-use",
@@ -78,6 +143,7 @@ app = FastAPI(
     description="Thin bytes-in/bytes-out HTTP wrapper around rembg.",
     version="0.1.0",
 )
+app.add_middleware(RequestBodyLimitMiddleware)
 
 _UPLOAD_CHUNK_BYTES = 64 * 1024
 _birefnet_admission_lock = threading.Lock()
@@ -106,20 +172,6 @@ async def _read_upload_limited(file: UploadFile, max_bytes: int) -> bytes:
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
     return b"".join(chunks)
 
-
-def _reject_invalid_or_oversized_declared_request(
-    request: Request, max_bytes: int
-) -> None:
-    """Reject unusable or excessive request lengths before application upload reads."""
-    content_length = request.headers.get("content-length")
-    if content_length is None:
-        return
-    if not content_length.isdecimal():
-        raise HTTPException(status_code=400, detail="Invalid Content-Length header")
-    if int(content_length) > max_bytes:
-        raise HTTPException(
-            status_code=413, detail="Request body is larger than this service accepts"
-        )
 
 
 def _consume_background_task_result(task: asyncio.Task[bytes]) -> None:
@@ -238,7 +290,6 @@ def clear_caches(
     },
 )
 async def remove_background(
-    request: Request,
     file: Annotated[UploadFile, File(description="Input image file bytes")],
     model: Annotated[
         SupportedModel, Query(description="Background-removal model name")
@@ -323,13 +374,10 @@ async def remove_background(
         )
 
     max_upload_bytes = max_upload_bytes_from_env()
-    max_request_bytes = max_request_bytes_from_env()
-    # Content-Length covers the multipart envelope as well as file bytes. It is
-    # checked only against the separate whole-request bound; _read_upload_limited
-    # continues to enforce the exact per-file bound while streaming the upload.
-    _reject_invalid_or_oversized_declared_request(request, max_request_bytes)
     input_limits = input_limits_from_env()
     output_limits = output_limits_from_env()
+    if output_limits.max_encoded_bytes is None:
+        raise RuntimeError("output byte limit is required")
     bria_request = model == BRIA_RMBG_2_MODEL_ID
     should_release_bria_cuda_cache = (
         should_release_cuda_cache_after_request()
@@ -354,6 +402,7 @@ async def remove_background(
         return_alpha=return_alpha,
         return_checker_preview=return_checker_preview,
         checker_size=checker_size,
+        max_encoded_bytes=output_limits.max_encoded_bytes,
     )
 
     admission: threading.BoundedSemaphore | None = None
@@ -432,6 +481,8 @@ async def remove_background(
         raise
     except ImageLimitError as exc:
         raise HTTPException(status_code=413, detail="Image exceeds this service's limits") from exc
+    except InvalidImageError as exc:
+        raise HTTPException(status_code=400, detail="Uploaded file is not a valid image") from exc
     except Exception as exc:
         logger.exception(
             "remove-background failed: model=%s model_input_size=%s device=%s dtype=%s error=%r",

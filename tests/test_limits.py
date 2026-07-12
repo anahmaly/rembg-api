@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from io import BytesIO
+import random
 
 import pytest
 from PIL import Image
 
+from rembg_api.image_processing import png_bytes as capped_png_bytes
 from rembg_api.limits import (
+    CappedBytesIO,
+    EncodedImageTooLarge,
     ImageLimitError,
     ImageLimits,
     max_request_bytes_from_env,
@@ -43,3 +47,25 @@ def test_decompression_bomb_is_a_safe_limit_error(monkeypatch) -> None:
     monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1)
     with pytest.raises(ImageLimitError, match="image dimensions exceed"):
         validate_image_bytes(png_bytes((2, 2)), limits, subject="upload")
+
+
+def test_real_png_encoding_stops_before_capped_writer_exceeds_limit() -> None:
+    pixels = random.Random(42).randbytes(128 * 128 * 3)
+    image = Image.frombytes("RGB", (128, 128), pixels)
+    writer = CappedBytesIO(100)
+
+    with pytest.raises(EncodedImageTooLarge):
+        image.save(writer, "PNG")
+
+    assert writer.maximum_size <= 100
+    assert len(writer.getvalue()) <= 100
+
+
+def test_capped_png_encoding_is_byte_identical_when_under_limit() -> None:
+    image = Image.new("RGBA", (7, 5), (10, 20, 30, 40))
+    expected = BytesIO()
+    image.save(expected, "PNG")
+
+    actual = capped_png_bytes(image, max_encoded_bytes=len(expected.getvalue()))
+
+    assert actual == expected.getvalue()

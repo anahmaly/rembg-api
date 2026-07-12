@@ -6,6 +6,8 @@ from typing import Literal, cast
 
 from PIL import Image, ImageFilter
 
+from rembg_api.limits import CappedBytesIO
+
 BackgroundColor = Literal["transparent", "white", "black", "custom"]
 DespillColor = Literal["black", "white", "green", "blue", "custom"]
 
@@ -25,8 +27,8 @@ class DespillOptions:
     hex_color: str = "000000"
 
 
-def png_bytes(image: Image.Image) -> bytes:
-    out = BytesIO()
+def png_bytes(image: Image.Image, *, max_encoded_bytes: int) -> bytes:
+    out = CappedBytesIO(max_encoded_bytes)
     image.save(out, format="PNG")
     return out.getvalue()
 
@@ -130,8 +132,10 @@ def composite_background(image: Image.Image, mode: BackgroundColor, hex_color: s
     return canvas
 
 
-def alpha_channel_png(image: Image.Image) -> bytes:
-    return png_bytes(image.convert("RGBA").getchannel("A"))
+def alpha_channel_png(image: Image.Image, *, max_encoded_bytes: int) -> bytes:
+    return png_bytes(
+        image.convert("RGBA").getchannel("A"), max_encoded_bytes=max_encoded_bytes
+    )
 
 
 def checker_preview(image: Image.Image, checker_size: int) -> Image.Image:
@@ -161,15 +165,18 @@ def process_png_bytes(
     return_alpha: bool,
     return_checker_preview: bool,
     checker_size: int,
+    max_encoded_bytes: int,
 ) -> bytes:
     image = load_rgba_png(data)
     image = refine_alpha(image, alpha)
     image = despill_image(image, despill)
 
     if return_alpha:
-        return alpha_channel_png(image)
+        return alpha_channel_png(image, max_encoded_bytes=max_encoded_bytes)
     if return_checker_preview:
-        return png_bytes(checker_preview(image, checker_size))
+        return png_bytes(
+            checker_preview(image, checker_size), max_encoded_bytes=max_encoded_bytes
+        )
 
     image = composite_background(image, background_color, background_hex)
-    return png_bytes(image)
+    return png_bytes(image, max_encoded_bytes=max_encoded_bytes)

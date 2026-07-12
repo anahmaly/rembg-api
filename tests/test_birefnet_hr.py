@@ -20,6 +20,7 @@ from rembg_api.birefnet_hr import (
     health_info,
     resolve_runtime,
 )
+from rembg_api.limits import EncodedImageTooLarge, ImageLimits
 from helpers import make_png
 
 
@@ -149,6 +150,33 @@ def test_preprocessing_prediction_and_exact_rgba_output(tmp_path):
         assert output.mode == "RGBA"
         assert output.size == (7, 5)
         assert 126 <= output.getchannel("A").getextrema()[0] <= 128
+
+
+def test_birefnet_real_png_encoding_honors_output_byte_cap(tmp_path):
+    import torch
+
+    class Model:
+        def to(self, **kwargs):
+            return self
+
+        def eval(self):
+            return self
+
+        def __call__(self, tensor):
+            return [torch.zeros((1, 1, 2, 2))]
+
+    backend = BiRefNetBackend(
+        config(tmp_path), "cpu", "fp32", loader=lambda *a, **k: Model()
+    )
+    limits = ImageLimits(100, 100, 10_000, max_encoded_bytes=20)
+
+    with pytest.raises(EncodedImageTooLarge):
+        backend.remove_background(
+            make_png(size=(16, 16)),
+            inference_size=512,
+            foreground_refinement=False,
+            output_limits=limits,
+        )
 
 
 def test_malformed_output_is_rejected(tmp_path):

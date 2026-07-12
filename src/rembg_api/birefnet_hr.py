@@ -12,6 +12,7 @@ from typing import Literal, Protocol
 from PIL import Image, UnidentifiedImageError
 
 from rembg_api.limits import (
+    CappedBytesIO,
     ImageLimitError,
     ImageLimits,
     input_limits_from_env,
@@ -276,10 +277,11 @@ class BiRefNetBackend:
                     r, g, b, a = pixels[x, y]
                     if a == 0:
                         pixels[x, y] = (0, 0, 0, 0)
-        output = BytesIO()
+        if output_limits.max_encoded_bytes is None:
+            raise ValueError("BiRefNet output byte limit is required")
+        output = CappedBytesIO(output_limits.max_encoded_bytes)
         rgba.save(output, "PNG")
         encoded = output.getvalue()
-        output_limits.validate_encoded_bytes(len(encoded), subject="output")
         return encoded
 
 

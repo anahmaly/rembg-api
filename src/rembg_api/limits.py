@@ -12,6 +12,33 @@ class ImageLimitError(ValueError):
     """A caller-safe image size or decode limit violation."""
 
 
+class InvalidImageError(ValueError):
+    """Malformed client-supplied image bytes."""
+
+
+class EncodedImageTooLarge(ImageLimitError):
+    """An encoder attempted to exceed its configured output byte limit."""
+
+
+class CappedBytesIO(BytesIO):
+    """In-memory writer that refuses a write before growing beyond ``max_bytes``."""
+
+    def __init__(self, max_bytes: int) -> None:
+        if max_bytes < 1:
+            raise ValueError("max_bytes must be positive")
+        super().__init__()
+        self.max_bytes = max_bytes
+        self.maximum_size = 0
+
+    def write(self, data: bytes, /) -> int:
+        resulting_size = max(len(self.getbuffer()), self.tell() + len(data))
+        if resulting_size > self.max_bytes:
+            raise EncodedImageTooLarge("encoded image exceeds configured byte limit")
+        written = super().write(data)
+        self.maximum_size = max(self.maximum_size, len(self.getbuffer()))
+        return written
+
+
 @dataclass(frozen=True)
 class ImageLimits:
     max_width: int
@@ -74,16 +101,22 @@ def max_request_bytes_from_env() -> int:
 
 
 def validate_image_bytes(data: bytes, limits: ImageLimits, *, subject: str) -> tuple[int, int]:
-    """Read only image headers and reject decompression bombs before pixel allocation."""
+    """Bound dimensions, then fully validate client image data before model work."""
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
             with Image.open(BytesIO(data)) as opened:
                 limits.validate_dimensions(opened.width, opened.height, subject=subject)
-                return opened.width, opened.height
+                dimensions = (opened.width, opened.height)
+                opened.verify()
+            # Some codecs only report truncation while loading. Dimensions are
+            # already bounded before this pixel allocation.
+            with Image.open(BytesIO(data)) as opened:
+                opened.load()
+            return dimensions
     except (Image.DecompressionBombWarning, Image.DecompressionBombError) as exc:
         raise ImageLimitError(f"{subject} image dimensions exceed configured limits") from exc
     except (UnidentifiedImageError, OSError, ValueError) as exc:
         if isinstance(exc, ImageLimitError):
             raise
-        raise ValueError(f"{subject} bytes are not a valid image") from exc
+        raise InvalidImageError(f"{subject} bytes are not a valid image") from exc

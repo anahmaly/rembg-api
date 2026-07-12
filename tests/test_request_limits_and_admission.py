@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from io import BytesIO
+import json
 
 import httpx
 import pytest
@@ -12,6 +13,130 @@ from rembg_api import birefnet_hr, main
 from rembg_api.birefnet_hr import BiRefNetConfig, DEFAULT_REVISION
 from rembg_api.limits import ImageLimits
 from helpers import make_png
+
+
+def _multipart_body(*parts: tuple[str, str, bytes, str]) -> tuple[bytes, str]:
+    boundary = "actual-stream-boundary"
+    chunks: list[bytes] = []
+    for name, filename, content, content_type in parts:
+        chunks.extend(
+            [
+                f"--{boundary}\r\n".encode(),
+                (
+                    f'Content-Disposition: form-data; name="{name}"; '
+                    f'filename="{filename}"\r\n'
+                ).encode(),
+                f"Content-Type: {content_type}\r\n\r\n".encode(),
+                content,
+                b"\r\n",
+            ]
+        )
+    chunks.append(f"--{boundary}--\r\n".encode())
+    return b"".join(chunks), boundary
+
+
+async def _stream_asgi_request(
+    body: bytes, boundary: str, *, content_length: int | None = None
+) -> tuple[int, dict[str, object], int]:
+    headers = [(b"content-type", f"multipart/form-data; boundary={boundary}".encode())]
+    if content_length is not None:
+        headers.append((b"content-length", str(content_length).encode()))
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/remove-background/",
+        "raw_path": b"/remove-background/",
+        "query_string": b"model=u2net",
+        "headers": headers,
+        "client": ("test", 1),
+        "server": ("test", 80),
+    }
+    midpoint = max(1, len(body) // 2)
+    messages = [
+        {"type": "http.request", "body": body[:midpoint], "more_body": True},
+        {"type": "http.request", "body": body[midpoint:], "more_body": False},
+    ]
+    reads = 0
+    sent: list[dict[str, object]] = []
+
+    async def receive() -> dict[str, object]:
+        nonlocal reads
+        reads += 1
+        return messages.pop(0)
+
+    async def send(message: dict[str, object]) -> None:
+        sent.append(message)
+
+    await main.app(scope, receive, send)
+    start = next(message for message in sent if message["type"] == "http.response.start")
+    response_body = b"".join(
+        message.get("body", b"")
+        for message in sent
+        if message["type"] == "http.response.body"
+    )
+    status = int(start["status"])
+    parsed = json.loads(response_body) if status != 200 else {}
+    return status, parsed, reads
+
+
+@pytest.mark.parametrize(
+    "parts",
+    [
+        (("ignored", "large.bin", b"x" * 500, "application/octet-stream"),),
+        (("file", "large.png", b"x" * 500, "image/png"),),
+    ],
+)
+def test_streamed_whole_multipart_limit_rejects_all_parts_before_route(
+    monkeypatch, parts
+) -> None:
+    body, boundary = _multipart_body(*parts)
+    monkeypatch.setattr(main, "max_request_bytes_from_env", lambda: len(body) - 1)
+    monkeypatch.setattr(main, "get_session", lambda model: pytest.fail("route called"))
+
+    status, detail, reads = asyncio.run(_stream_asgi_request(body, boundary))
+
+    assert status == 413
+    assert detail["detail"] == "Request body is larger than this service accepts"
+    assert reads == 2
+
+
+def test_declared_whole_request_limit_rejects_without_consuming_body(monkeypatch) -> None:
+    body, boundary = _multipart_body(("file", "in.png", make_png(), "image/png"))
+    monkeypatch.setattr(main, "max_request_bytes_from_env", lambda: len(body) - 1)
+    monkeypatch.setattr(main, "get_session", lambda model: pytest.fail("route called"))
+
+    status, detail, reads = asyncio.run(
+        _stream_asgi_request(body, boundary, content_length=len(body))
+    )
+
+    assert status == 413
+    assert detail["detail"] == "Request body is larger than this service accepts"
+    assert reads == 0
+
+
+def test_streamed_under_limit_multipart_reaches_backend(monkeypatch) -> None:
+    body, boundary = _multipart_body(("file", "in.png", make_png(), "image/png"))
+    calls = 0
+    monkeypatch.setattr(main, "max_request_bytes_from_env", lambda: len(body))
+    monkeypatch.setattr(main, "max_upload_bytes_from_env", lambda: len(body))
+    monkeypatch.setattr(main, "new_session", lambda model: object())
+
+    def fake_remove(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return make_png()
+
+    monkeypatch.setattr(main, "remove", fake_remove)
+    main.get_session.cache_clear()
+
+    status, _, reads = asyncio.run(_stream_asgi_request(body, boundary))
+
+    assert status == 200
+    assert calls == 1
+    assert reads == 2
 
 
 def test_multipart_content_length_over_file_limit_does_not_reject_near_limit_file(
@@ -135,6 +260,46 @@ def test_birefnet_decompression_bomb_returns_413_before_backend_load(monkeypatch
     )
 
     assert response.status_code == 413
+
+
+@pytest.mark.parametrize("kind", ["not-image", "truncated-jpeg"])
+def test_malformed_client_image_returns_safe_400_before_backend(
+    monkeypatch, kind
+) -> None:
+    if kind == "not-image":
+        payload = b"not image"
+    else:
+        output = BytesIO()
+        Image.new("RGB", (16, 16), (1, 2, 3)).save(output, "JPEG")
+        payload = output.getvalue()[:-20]
+    monkeypatch.setattr(main, "new_session", lambda model: pytest.fail("backend loaded"))
+    main.get_session.cache_clear()
+
+    from fastapi.testclient import TestClient
+
+    response = TestClient(main.app).post(
+        "/remove-background/?model=u2net",
+        files={"file": ("bad.img", payload, "application/octet-stream")},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Uploaded file is not a valid image"}
+
+
+def test_truncated_png_returns_safe_400_before_backend(monkeypatch) -> None:
+    payload = make_png()[:-10]
+    monkeypatch.setattr(main, "new_session", lambda model: pytest.fail("backend loaded"))
+    main.get_session.cache_clear()
+
+    from fastapi.testclient import TestClient
+
+    response = TestClient(main.app).post(
+        "/remove-background/?model=u2net",
+        files={"file": ("bad.png", payload, "image/png")},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Uploaded file is not a valid image"}
 
 
 def test_lazy_chunked_upload_is_rejected_at_actual_byte_limit() -> None:
