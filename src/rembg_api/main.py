@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import gc
 import logging
 import sys
+import threading
 from functools import lru_cache, partial
 from typing import Annotated, Literal
 
 from anyio import to_thread
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import Response
 import onnxruntime as ort
 from rembg import new_session, remove
@@ -28,11 +30,19 @@ from rembg_api.bria_rmbg import (
 )
 from rembg_api.birefnet_hr import (
     BIREFNET_MODEL_NAME,
+    BiRefNetConfig,
     clear_cache as clear_birefnet_cache,
     health_info as birefnet_health_info,
     remove_with_birefnet,
 )
 from rembg_api.image_processing import AlphaOptions, DespillOptions, process_png_bytes
+from rembg_api.limits import (
+    ImageLimitError,
+    input_limits_from_env,
+    max_upload_bytes_from_env,
+    output_limits_from_env,
+    validate_image_bytes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +77,55 @@ app = FastAPI(
     description="Thin bytes-in/bytes-out HTTP wrapper around rembg.",
     version="0.1.0",
 )
+
+_UPLOAD_CHUNK_BYTES = 64 * 1024
+_birefnet_admission_lock = threading.Lock()
+_birefnet_admissions: dict[BiRefNetConfig, threading.BoundedSemaphore] = {}
+
+
+def _birefnet_admission(config: BiRefNetConfig) -> threading.BoundedSemaphore:
+    """Return the process-wide, non-queueing heavy-path admission gate."""
+    with _birefnet_admission_lock:
+        return _birefnet_admissions.setdefault(
+            config, threading.BoundedSemaphore(config.max_concurrency)
+        )
+
+
+async def _read_upload_limited(file: UploadFile, max_bytes: int) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while chunk := await file.read(_UPLOAD_CHUNK_BYTES):
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(
+                status_code=413, detail="Uploaded image is larger than this service accepts"
+            )
+        chunks.append(chunk)
+    if not chunks:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    return b"".join(chunks)
+
+
+def _reject_oversized_content_length(request: Request, max_bytes: int) -> None:
+    content_length = request.headers.get("content-length")
+    if content_length is None:
+        return
+    try:
+        if int(content_length) > max_bytes:
+            raise HTTPException(
+                status_code=413, detail="Uploaded image is larger than this service accepts"
+            )
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid Content-Length header") from None
+
+
+def _consume_background_task_result(task: asyncio.Task[bytes]) -> None:
+    try:
+        task.result()
+    except (asyncio.CancelledError, Exception):
+        # The original requester has already been notified or disconnected. The
+        # worker's finally block has released admission before this callback runs.
+        pass
 
 
 @lru_cache(maxsize=len(REMBG_MODELS))
@@ -170,10 +229,13 @@ def clear_caches(
     responses={
         200: {"content": {"image/png": {}}},
         400: {"description": "Invalid request"},
+        413: {"description": "Image or upload exceeds service limits"},
+        429: {"description": "BiRefNet capacity is currently unavailable"},
         500: {"description": "Internal processing error"},
     },
 )
 async def remove_background(
+    request: Request,
     file: Annotated[UploadFile, File(description="Input image file bytes")],
     model: Annotated[
         SupportedModel, Query(description="Background-removal model name")
@@ -257,85 +319,112 @@ async def remove_background(
             status_code=400, detail="Only png output_format is supported"
         )
 
-    input_bytes = await file.read()
-    if not input_bytes:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty")
-
+    max_upload_bytes = max_upload_bytes_from_env()
+    _reject_oversized_content_length(request, max_upload_bytes)
+    input_limits = input_limits_from_env()
+    output_limits = output_limits_from_env()
     bria_request = model == BRIA_RMBG_2_MODEL_ID
     should_release_bria_cuda_cache = (
         should_release_cuda_cache_after_request()
         if release_cuda_cache is None
         else release_cuda_cache
     )
+    process = partial(
+        process_png_bytes,
+        alpha=AlphaOptions(
+            blur=alpha_blur,
+            erode=alpha_erode,
+            dilate=alpha_dilate,
+            threshold=alpha_threshold,
+        ),
+        despill=DespillOptions(
+            enabled=despill,
+            color=despill_color,
+            hex_color=despill_hex,
+        ),
+        background_color=background_color,
+        background_hex=background_hex,
+        return_alpha=return_alpha,
+        return_checker_preview=return_checker_preview,
+        checker_size=checker_size,
+    )
 
+    admission: threading.BoundedSemaphore | None = None
     try:
         if model == BIREFNET_MODEL_NAME:
-            # Cancellation abandons response waiting, not the worker: a running GPU
-            # kernel cannot be force-cancelled. The worker safely finishes and the
-            # backend context manager releases its bounded semaphore.
-            removed = await to_thread.run_sync(
-                partial(
-                    remove_with_birefnet,
-                    input_bytes,
-                    inference_size=birefnet_inference_size,
-                    foreground_refinement=birefnet_foreground_refinement,
-                ),
-                abandon_on_cancel=True,
-            )
-        elif bria_request:
-            removed = remove_with_bria_rmbg_2(
-                input_bytes,
-                model_input_size=model_input_size,
-                device=device,
-                dtype=dtype,
-                release_cuda_cache=release_cuda_cache,
-                cleanup_after_request=False,
-            )
-        else:
-            session = get_session(model)
-            removed = remove(
-                input_bytes,
-                session=session,
-                only_mask=only_mask,
-                post_process_mask=post_process_mask,
-                alpha_matting=alpha_matting,
-                alpha_matting_foreground_threshold=alpha_matting_foreground_threshold,
-                alpha_matting_background_threshold=alpha_matting_background_threshold,
-                alpha_matting_erode_size=alpha_matting_erode_size,
-            )
-        if not isinstance(removed, bytes):
-            raise RuntimeError(
-                f"background removal returned {type(removed)!r}, expected bytes"
-            )
+            # This instant, process-wide gate has no waiting queue. It is acquired
+            # before file reading and remains owned by the worker until *all* heavy
+            # BiRefNet work (load/decode/preprocess/infer/postprocess) has finished.
+            config = BiRefNetConfig.from_env()
+            candidate_admission = _birefnet_admission(config)
+            if not candidate_admission.acquire(blocking=False):
+                raise HTTPException(
+                    status_code=429,
+                    detail="BiRefNet is busy; please try again shortly",
+                )
+            admission = candidate_admission
+            input_bytes = await _read_upload_limited(file, max_upload_bytes)
+            worker_admission = admission
 
-        process = partial(
-            process_png_bytes,
-            removed,
-            alpha=AlphaOptions(
-                blur=alpha_blur,
-                erode=alpha_erode,
-                dilate=alpha_dilate,
-                threshold=alpha_threshold,
-            ),
-            despill=DespillOptions(
-                enabled=despill,
-                color=despill_color,
-                hex_color=despill_hex,
-            ),
-            background_color=background_color,
-            background_hex=background_hex,
-            return_alpha=return_alpha,
-            return_checker_preview=return_checker_preview,
-            checker_size=checker_size,
-        )
-        output_bytes = (
-            await to_thread.run_sync(process, abandon_on_cancel=True)
-            if model == BIREFNET_MODEL_NAME
-            else process()
-        )
+            def work() -> bytes:
+                try:
+                    removed = remove_with_birefnet(
+                        input_bytes,
+                        inference_size=birefnet_inference_size,
+                        foreground_refinement=birefnet_foreground_refinement,
+                        config=config,
+                        input_limits=input_limits,
+                        output_limits=output_limits,
+                    )
+                    validate_image_bytes(removed, output_limits, subject="output")
+                    encoded = process(removed)
+                    output_limits.validate_encoded_bytes(len(encoded), subject="output")
+                    return encoded
+                finally:
+                    worker_admission.release()
+
+            # A shielded task is the bounded ownership handoff: cancellation stops
+            # response waiting, but never cancels or abandons the admitted worker.
+            task = asyncio.create_task(to_thread.run_sync(work))
+            task.add_done_callback(_consume_background_task_result)
+            admission = None
+            output_bytes = await asyncio.shield(task)
+        else:
+            input_bytes = await _read_upload_limited(file, max_upload_bytes)
+            validate_image_bytes(input_bytes, input_limits, subject="upload")
+            if bria_request:
+                removed = remove_with_bria_rmbg_2(
+                    input_bytes,
+                    model_input_size=model_input_size,
+                    device=device,
+                    dtype=dtype,
+                    release_cuda_cache=release_cuda_cache,
+                    cleanup_after_request=False,
+                )
+            else:
+                session = get_session(model)
+                removed = remove(
+                    input_bytes,
+                    session=session,
+                    only_mask=only_mask,
+                    post_process_mask=post_process_mask,
+                    alpha_matting=alpha_matting,
+                    alpha_matting_foreground_threshold=alpha_matting_foreground_threshold,
+                    alpha_matting_background_threshold=alpha_matting_background_threshold,
+                    alpha_matting_erode_size=alpha_matting_erode_size,
+                )
+            if not isinstance(removed, bytes):
+                raise RuntimeError(
+                    f"background removal returned {type(removed)!r}, expected bytes"
+                )
+            validate_image_bytes(removed, output_limits, subject="output")
+            output_bytes = process(removed)
+            output_limits.validate_encoded_bytes(len(output_bytes), subject="output")
         return Response(content=output_bytes, media_type="image/png")
     except HTTPException:
         raise
+    except ImageLimitError as exc:
+        raise HTTPException(status_code=413, detail="Image exceeds this service's limits") from exc
     except Exception as exc:
         logger.exception(
             "remove-background failed: model=%s model_input_size=%s device=%s dtype=%s error=%r",
@@ -349,5 +438,7 @@ async def remove_background(
             status_code=500, detail="Internal image processing error"
         ) from exc
     finally:
+        if admission is not None:
+            admission.release()
         if bria_request:
             release_request_memory(release_cuda_cache=should_release_bria_cuda_cache)

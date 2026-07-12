@@ -265,7 +265,9 @@ def test_api_and_openapi_select_birefnet(monkeypatch):
     with Image.open(BytesIO(response.content)) as output:
         assert output.mode == "RGBA"
         assert output.size == (4, 3)
-    assert calls == {"inference_size": 2048, "foreground_refinement": True}
+    assert calls["inference_size"] == 2048
+    assert calls["foreground_refinement"] is True
+    assert isinstance(calls["config"], BiRefNetConfig)
     schema = client.get("/openapi.json").json()
     operation = schema["paths"]["/remove-background/"]["post"]
     names = {parameter["name"] for parameter in operation["parameters"]}
@@ -278,6 +280,7 @@ def test_api_and_openapi_select_birefnet(monkeypatch):
         "schema"
     ]
     assert "birefnet-hr-matting" in model_schema["enum"]
+    assert {"413", "429"} <= set(operation["responses"])
 
 
 def test_lazy_cache_loads_once(tmp_path, monkeypatch):

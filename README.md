@@ -7,7 +7,8 @@ Thin FastAPI bytes-in/bytes-out wrapper around [`rembg`](https://github.com/dani
 - `POST /remove-background/` accepts multipart image bytes in a `file` field.
 - The response is PNG bytes (`Content-Type: image/png`).
 - Normal requests do not require temporary filesystem files; input and output are handled as bytes in process.
-- OpenAPI docs are available from FastAPI at `/docs` and `/openapi.json`.
+- OpenAPI docs are available from FastAPI at `/docs` and `/openapi.json`; `/remove-background/` documents `413` size-limit and `429` BiRefNet-capacity responses.
+- Request and image limits are applied before expensive image work; the defaults are intentionally finite and configurable below.
 - `GET /health` reports ONNX Runtime provider availability plus BRIA RMBG-2.0 torch/CUDA, CUDA memory stats, and local-path status without downloading weights.
 - `GET /models` lists supported model IDs and whether the configured BRIA RMBG-2.0 path is present/readable.
 - `POST /cache/clear` clears cached rembg, BRIA RMBG-2.0, and BiRefNet backends, then reports whether optional CUDA allocator cleanup actually ran.
@@ -244,6 +245,23 @@ curl -sS -X POST "http://localhost:8001/remove-background/?return_checker_previe
 
 If both `return_alpha` and `return_checker_preview` are true, `return_alpha` takes precedence.
 
+## Request and image limits
+
+The service applies these process-wide bounds to every `/remove-background/` request. They preserve normal rembg-compatible images within the configured limits and reject invalid or oversized work before costly decode, tensor, or RGBA allocations. A declared multipart `Content-Length` over `REMBG_MAX_UPLOAD_BYTES` is rejected immediately; uploads without a usable length are read in 64 KiB chunks and stop at the same byte limit. Image headers are checked before RGB conversion, and output dimensions are checked before BiRefNet alpha resizing/RGBA allocation and again before postprocessing. Final encoded PNG bytes are also bounded.
+
+| Variable | Default | Scope |
+| --- | --- | --- |
+| `REMBG_MAX_UPLOAD_BYTES` | `20000000` | Input file bytes read from multipart upload. |
+| `REMBG_MAX_INPUT_WIDTH` | `10000` | Decoded source-image width. |
+| `REMBG_MAX_INPUT_HEIGHT` | `10000` | Decoded source-image height. |
+| `REMBG_MAX_INPUT_PIXELS` | `40000000` | Decoded source-image pixels. Pillow decompression-bomb warnings/errors are treated as a safe rejection. |
+| `REMBG_MAX_OUTPUT_WIDTH` | `10000` | Decoded model-output width. |
+| `REMBG_MAX_OUTPUT_HEIGHT` | `10000` | Decoded model-output height. |
+| `REMBG_MAX_OUTPUT_PIXELS` | `40000000` | Decoded model-output pixels. |
+| `REMBG_MAX_OUTPUT_BYTES` | `40000000` | Final encoded PNG response bytes. |
+
+Limit rejections use `413` and a generic message; invalid request bodies continue to use normal `400`/`422` responses. For BiRefNet, admission has no wait queue: a request that cannot immediately reserve capacity returns `429`, so queued or cancelled clients cannot accumulate background workers.
+
 ## Runtime notes
 
 - First request per rembg model may download weights/cache the model before inference begins.
@@ -315,7 +333,7 @@ docker compose -f compose.gpu.yml up --build           # CUDA / fp16
 
 The default cache key includes effective source, revision, offline/trust policy, cache directory, resolved device, resolved precision, and concurrency. Loading is lazy and concurrency-safe; no model is loaded by startup, `/health`, or `/models`. GPU inference defaults to one concurrent call to avoid overlapping roughly 444 MB of weights plus provisional multi-GB 2048px activation/working memory. Actual VRAM and image quality are not guaranteed until evaluated on the target GPU; lower `BIREFNET_INFERENCE_SIZE` if memory is constrained.
 
-BiRefNet model loading, preprocessing, bounded-concurrency waiting, inference, postprocessing, and PNG encoding run in worker threads rather than on the FastAPI event loop. If a client disconnects or its request task is cancelled, response waiting stops promptly. Python cannot force-cancel an already-running CUDA kernel, so that worker safely finishes in the background and releases the backend semaphore before its references are discarded.
+BiRefNet admission is process-wide and immediate: `BIREFNET_MAX_CONCURRENCY` reserves a slot before endpoint file reading and holds it through worker-thread model loading, header decode, preprocessing, inference, postprocessing, and encoding. There is deliberately no admission wait queue; a saturated request receives seller-safe `429` and does no BiRefNet preprocessing. If a client disconnects or its request task is cancelled after admission, response waiting stops promptly while the already-admitted worker keeps its reservation until it genuinely exits. This bounded task handoff prevents cancellation storms from accumulating abandoned workers; `/health` remains event-loop responsive and capacity recovers when the worker finishes.
 
 ```bash
 curl -sS -X POST \

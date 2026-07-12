@@ -11,6 +11,14 @@ from typing import Literal, Protocol
 
 from PIL import Image, UnidentifiedImageError
 
+from rembg_api.limits import (
+    ImageLimitError,
+    ImageLimits,
+    input_limits_from_env,
+    output_limits_from_env,
+    validate_image_bytes,
+)
+
 logger = logging.getLogger(__name__)
 
 BIREFNET_MODEL_NAME = "birefnet-hr-matting"
@@ -183,6 +191,8 @@ class BiRefNetBackend:
         *,
         inference_size: int,
         foreground_refinement: bool,
+        input_limits: ImageLimits | None = None,
+        output_limits: ImageLimits | None = None,
     ) -> bytes:
         import torch
         from torchvision.transforms.functional import (
@@ -192,12 +202,20 @@ class BiRefNetBackend:
             to_pil_image,
         )
 
+        input_limits = input_limits or input_limits_from_env()
+        output_limits = output_limits or output_limits_from_env()
+        validate_image_bytes(data, input_limits, subject="upload")
         try:
             with Image.open(BytesIO(data)) as opened:
+                # Check dimensions immediately after header parsing, before RGB
+                # conversion or tensor allocation.
+                input_limits.validate_dimensions(
+                    opened.width, opened.height, subject="upload"
+                )
                 opened.load()
-                if opened.width < 1 or opened.height < 1:
-                    raise ValueError("input image has invalid dimensions")
                 original = opened.convert("RGB")
+        except ImageLimitError:
+            raise
         except (UnidentifiedImageError, OSError, ValueError) as exc:
             raise ValueError("uploaded bytes are not a valid image") from exc
 
@@ -232,6 +250,10 @@ class BiRefNetBackend:
         if not bool(torch.isfinite(prediction).all()):
             raise RuntimeError("BiRefNet returned non-finite alpha values")
         prediction = prediction.clamp(0, 1)
+        # Reject before resizing alpha or allocating the final RGBA image.
+        output_limits.validate_dimensions(
+            original.width, original.height, subject="output"
+        )
         prediction = resize(
             prediction.unsqueeze(0), [original.height, original.width], antialias=True
         ).squeeze(0)
@@ -250,7 +272,9 @@ class BiRefNetBackend:
                         pixels[x, y] = (0, 0, 0, 0)
         output = BytesIO()
         rgba.save(output, "PNG")
-        return output.getvalue()
+        encoded = output.getvalue()
+        output_limits.validate_encoded_bytes(len(encoded), subject="output")
+        return encoded
 
 
 BackendKey = tuple[
@@ -371,6 +395,8 @@ def remove_with_birefnet(
     inference_size: int | None = None,
     foreground_refinement: bool | None = None,
     config: BiRefNetConfig | None = None,
+    input_limits: ImageLimits | None = None,
+    output_limits: ImageLimits | None = None,
 ) -> bytes:
     config = config or BiRefNetConfig.from_env()
     size = config.inference_size if inference_size is None else inference_size
@@ -382,7 +408,11 @@ def remove_with_birefnet(
         else foreground_refinement
     )
     return get_backend(config).remove_background(
-        data, inference_size=size, foreground_refinement=refinement
+        data,
+        inference_size=size,
+        foreground_refinement=refinement,
+        input_limits=input_limits,
+        output_limits=output_limits,
     )
 
 
