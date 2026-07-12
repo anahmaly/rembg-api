@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import gc
 import logging
-from functools import lru_cache
+import sys
+from functools import lru_cache, partial
 from typing import Annotated, Literal
+
+from anyio import to_thread
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
@@ -16,6 +20,7 @@ from rembg_api.bria_rmbg import (
     clear_bria_backend_cache,
     configured_model_path,
     get_torch_status,
+    get_bria_rmbg_2_backend,
     local_model_status,
     release_request_memory,
     remove_with_bria_rmbg_2,
@@ -31,7 +36,15 @@ from rembg_api.image_processing import AlphaOptions, DespillOptions, process_png
 
 logger = logging.getLogger(__name__)
 
-SupportedModel = Literal["isnet-general-use", "u2net", "u2netp", "isnet-anime", "silueta", "bria-rmbg-2.0", "birefnet-hr-matting"]
+SupportedModel = Literal[
+    "isnet-general-use",
+    "u2net",
+    "u2netp",
+    "isnet-anime",
+    "silueta",
+    "bria-rmbg-2.0",
+    "birefnet-hr-matting",
+]
 OutputFormat = Literal["png"]
 BackgroundColor = Literal["transparent", "white", "black", "custom"]
 DespillColor = Literal["black", "white", "green", "blue", "custom"]
@@ -43,7 +56,11 @@ REMBG_MODELS: tuple[str, ...] = (
     "isnet-anime",
     "silueta",
 )
-SUPPORTED_MODELS: tuple[str, ...] = (*REMBG_MODELS, BRIA_RMBG_2_MODEL_ID, BIREFNET_MODEL_NAME)
+SUPPORTED_MODELS: tuple[str, ...] = (
+    *REMBG_MODELS,
+    BRIA_RMBG_2_MODEL_ID,
+    BIREFNET_MODEL_NAME,
+)
 
 app = FastAPI(
     title="rembg-api",
@@ -106,7 +123,10 @@ def models() -> dict[str, object]:
                 "configured_path": configured_model_path(),
                 **get_bria_model_info(),
             },
-            BIREFNET_MODEL_NAME: {"backend": "torch-transformers", **birefnet_health_info()},
+            BIREFNET_MODEL_NAME: {
+                "backend": "torch-transformers",
+                **birefnet_health_info(),
+            },
         },
     }
 
@@ -115,14 +135,33 @@ def models() -> dict[str, object]:
 def clear_caches(
     release_cuda_cache: Annotated[
         bool,
-        Query(description="Run torch.cuda.empty_cache() after clearing caches when CUDA is available"),
+        Query(
+            description="Run torch.cuda.empty_cache() after clearing caches when CUDA is available"
+        ),
     ] = True,
 ) -> dict[str, object]:
     """Clear cached rembg sessions and BRIA backends for LAN-local resource recovery."""
     get_session.cache_clear()
-    clear_bria_backend_cache(release_cuda_cache=release_cuda_cache)
-    clear_birefnet_cache()
-    return {"status": "ok", "rembg_sessions_cleared": True, "bria_backends_cleared": True, "birefnet_backends_cleared": True}
+    bria_was_loaded = get_bria_rmbg_2_backend.cache_info().currsize > 0
+    clear_bria_backend_cache(release_cuda_cache=False)
+    birefnet_cleared = clear_birefnet_cache()
+    gc.collect()
+    cuda_cache_released = False
+    if release_cuda_cache and (bria_was_loaded or birefnet_cleared > 0):
+        # Loaded torch backends necessarily imported torch. Do not import it just
+        # because an operator clears a service that has never used one.
+        torch = sys.modules.get("torch")
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            cuda_cache_released = True
+    return {
+        "status": "ok",
+        "rembg_sessions_cleared": True,
+        "bria_backends_cleared": True,
+        "birefnet_backends_cleared": True,
+        "cuda_cache_release_requested": release_cuda_cache,
+        "cuda_cache_released": cuda_cache_released,
+    }
 
 
 @app.post(
@@ -136,28 +175,58 @@ def clear_caches(
 )
 async def remove_background(
     file: Annotated[UploadFile, File(description="Input image file bytes")],
-    model: Annotated[SupportedModel, Query(description="Background-removal model name")] = "isnet-general-use",
-    only_mask: Annotated[bool, Query(description="Return rembg's raw mask output; ignored for bria-rmbg-2.0")] = False,
-    post_process_mask: Annotated[bool, Query(description="Enable rembg mask post-processing; ignored for bria-rmbg-2.0")] = False,
-    alpha_matting: Annotated[bool, Query(description="Enable rembg alpha matting; ignored for bria-rmbg-2.0")] = False,
+    model: Annotated[
+        SupportedModel, Query(description="Background-removal model name")
+    ] = "isnet-general-use",
+    only_mask: Annotated[
+        bool,
+        Query(description="Return rembg's raw mask output; ignored for bria-rmbg-2.0"),
+    ] = False,
+    post_process_mask: Annotated[
+        bool,
+        Query(
+            description="Enable rembg mask post-processing; ignored for bria-rmbg-2.0"
+        ),
+    ] = False,
+    alpha_matting: Annotated[
+        bool, Query(description="Enable rembg alpha matting; ignored for bria-rmbg-2.0")
+    ] = False,
     alpha_matting_foreground_threshold: Annotated[int, Query(ge=0, le=255)] = 240,
     alpha_matting_background_threshold: Annotated[int, Query(ge=0, le=255)] = 10,
     alpha_matting_erode_size: Annotated[int, Query(ge=0)] = 10,
-    model_input_size: Annotated[int, Query(ge=512, le=2048, description="BRIA RMBG-2.0 square model input size")] = 1024,
-    device: Annotated[BriaDevice, Query(description="BRIA RMBG-2.0 device selection")] = "auto",
-    dtype: Annotated[BriaDType, Query(description="BRIA RMBG-2.0 model precision")] = "auto",
-    output_format: Annotated[OutputFormat, Query(description="Output image format; v1 supports PNG")] = "png",
-    background_color: Annotated[BackgroundColor, Query(description="Optional background compositing mode")] = "transparent",
+    model_input_size: Annotated[
+        int, Query(ge=512, le=2048, description="BRIA RMBG-2.0 square model input size")
+    ] = 1024,
+    device: Annotated[
+        BriaDevice, Query(description="BRIA RMBG-2.0 device selection")
+    ] = "auto",
+    dtype: Annotated[
+        BriaDType, Query(description="BRIA RMBG-2.0 model precision")
+    ] = "auto",
+    output_format: Annotated[
+        OutputFormat, Query(description="Output image format; v1 supports PNG")
+    ] = "png",
+    background_color: Annotated[
+        BackgroundColor, Query(description="Optional background compositing mode")
+    ] = "transparent",
     background_hex: Annotated[str, Query(pattern=r"^#?[0-9a-fA-F]{6}$")] = "ffffff",
     alpha_blur: Annotated[float, Query(ge=0, le=20)] = 0.0,
     alpha_erode: Annotated[int, Query(ge=0, le=100)] = 0,
     alpha_dilate: Annotated[int, Query(ge=0, le=100)] = 0,
     alpha_threshold: Annotated[int, Query(ge=0, le=255)] = 0,
-    despill: Annotated[bool, Query(description="Reduce selected color spill on foreground edges")] = False,
-    despill_color: Annotated[DespillColor, Query(description="Spill color to reduce")] = "black",
+    despill: Annotated[
+        bool, Query(description="Reduce selected color spill on foreground edges")
+    ] = False,
+    despill_color: Annotated[
+        DespillColor, Query(description="Spill color to reduce")
+    ] = "black",
     despill_hex: Annotated[str, Query(pattern=r"^#?[0-9a-fA-F]{6}$")] = "000000",
-    return_alpha: Annotated[bool, Query(description="Return grayscale alpha PNG bytes")] = False,
-    return_checker_preview: Annotated[bool, Query(description="Return checker-composited preview PNG bytes")] = False,
+    return_alpha: Annotated[
+        bool, Query(description="Return grayscale alpha PNG bytes")
+    ] = False,
+    return_checker_preview: Annotated[
+        bool, Query(description="Return checker-composited preview PNG bytes")
+    ] = False,
     checker_size: Annotated[int, Query(ge=2, le=128)] = 32,
     release_cuda_cache: Annotated[
         bool | None,
@@ -168,11 +237,25 @@ async def remove_background(
             )
         ),
     ] = None,
-    birefnet_inference_size: Annotated[int | None, Query(ge=512, le=4096, description="BiRefNet square input size; env/default is 2048")] = None,
-    birefnet_foreground_refinement: Annotated[bool | None, Query(description="BiRefNet only: clear hidden RGB for fully transparent pixels; alpha is unchanged")] = None,
+    birefnet_inference_size: Annotated[
+        int | None,
+        Query(
+            ge=512,
+            le=4096,
+            description="BiRefNet square input size; env/default is 2048",
+        ),
+    ] = None,
+    birefnet_foreground_refinement: Annotated[
+        bool | None,
+        Query(
+            description="BiRefNet only: clear hidden RGB for fully transparent pixels; alpha is unchanged"
+        ),
+    ] = None,
 ) -> Response:
     if output_format != "png":
-        raise HTTPException(status_code=400, detail="Only png output_format is supported")
+        raise HTTPException(
+            status_code=400, detail="Only png output_format is supported"
+        )
 
     input_bytes = await file.read()
     if not input_bytes:
@@ -180,15 +263,24 @@ async def remove_background(
 
     bria_request = model == BRIA_RMBG_2_MODEL_ID
     should_release_bria_cuda_cache = (
-        should_release_cuda_cache_after_request() if release_cuda_cache is None else release_cuda_cache
+        should_release_cuda_cache_after_request()
+        if release_cuda_cache is None
+        else release_cuda_cache
     )
 
     try:
         if model == BIREFNET_MODEL_NAME:
-            removed = remove_with_birefnet(
-                input_bytes,
-                inference_size=birefnet_inference_size,
-                foreground_refinement=birefnet_foreground_refinement,
+            # Cancellation abandons response waiting, not the worker: a running GPU
+            # kernel cannot be force-cancelled. The worker safely finishes and the
+            # backend context manager releases its bounded semaphore.
+            removed = await to_thread.run_sync(
+                partial(
+                    remove_with_birefnet,
+                    input_bytes,
+                    inference_size=birefnet_inference_size,
+                    foreground_refinement=birefnet_foreground_refinement,
+                ),
+                abandon_on_cancel=True,
             )
         elif bria_request:
             removed = remove_with_bria_rmbg_2(
@@ -212,9 +304,12 @@ async def remove_background(
                 alpha_matting_erode_size=alpha_matting_erode_size,
             )
         if not isinstance(removed, bytes):
-            raise RuntimeError(f"background removal returned {type(removed)!r}, expected bytes")
+            raise RuntimeError(
+                f"background removal returned {type(removed)!r}, expected bytes"
+            )
 
-        output_bytes = process_png_bytes(
+        process = partial(
+            process_png_bytes,
             removed,
             alpha=AlphaOptions(
                 blur=alpha_blur,
@@ -233,6 +328,11 @@ async def remove_background(
             return_checker_preview=return_checker_preview,
             checker_size=checker_size,
         )
+        output_bytes = (
+            await to_thread.run_sync(process, abandon_on_cancel=True)
+            if model == BIREFNET_MODEL_NAME
+            else process()
+        )
         return Response(content=output_bytes, media_type="image/png")
     except HTTPException:
         raise
@@ -245,7 +345,9 @@ async def remove_background(
             dtype,
             exc,
         )
-        raise HTTPException(status_code=500, detail="Internal image processing error") from exc
+        raise HTTPException(
+            status_code=500, detail="Internal image processing error"
+        ) from exc
     finally:
         if bria_request:
             release_request_memory(release_cuda_cache=should_release_bria_cuda_cache)

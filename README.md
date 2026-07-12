@@ -10,7 +10,7 @@ Thin FastAPI bytes-in/bytes-out wrapper around [`rembg`](https://github.com/dani
 - OpenAPI docs are available from FastAPI at `/docs` and `/openapi.json`.
 - `GET /health` reports ONNX Runtime provider availability plus BRIA RMBG-2.0 torch/CUDA, CUDA memory stats, and local-path status without downloading weights.
 - `GET /models` lists supported model IDs and whether the configured BRIA RMBG-2.0 path is present/readable.
-- `POST /cache/clear` clears cached rembg sessions and BRIA RMBG-2.0 backends, then runs Python/CUDA cleanup for LAN-local resource recovery.
+- `POST /cache/clear` clears cached rembg, BRIA RMBG-2.0, and BiRefNet backends, then reports whether optional CUDA allocator cleanup actually ran.
 
 ## Run locally
 
@@ -156,7 +156,7 @@ Returns the default model, supported model names, and BRIA RMBG-2.0 configured l
 
 ### `POST /cache/clear`
 
-Clears cached rembg sessions and BRIA RMBG-2.0 cached backends, runs `gc.collect()`, and calls `torch.cuda.empty_cache()` by default when CUDA is available. The service has no built-in auth, so keep it LAN-local or behind your own trusted network boundary.
+Clears cached rembg sessions plus BRIA RMBG-2.0 and BiRefNet backends, then runs `gc.collect()`. With `release_cuda_cache=true` (the default), `torch.cuda.empty_cache()` runs only when a torch backend was loaded and CUDA is available; clearing an unused service does not import or load torch/models. The response reports both `cuda_cache_release_requested` and `cuda_cache_released`. The service has no built-in auth, so keep it LAN-local or behind your own trusted network boundary.
 
 ```bash
 curl -sS -X POST "http://localhost:8001/cache/clear"
@@ -313,7 +313,9 @@ docker compose up --build rembg-api                    # CPU / fp32
 docker compose -f compose.gpu.yml up --build           # CUDA / fp16
 ```
 
-The default cache key includes effective source, revision, offline/trust policy, cache directory, resolved device, resolved precision, and concurrency. Loading is lazy and concurrency-safe; no model is loaded by startup, `/health`, or `/models`. GPU inference defaults to one concurrent call to avoid overlapping roughly 444 MB of weights plus provisional multi-GB 2048px activation/working memory. Actual VRAM and image quality are not guaranteed until evaluated on the target GPU; lower `BIREFNET_INFERENCE_SIZE` or keep `BIREFNET_MAX_CONCURRENCY=1` after OOM.
+The default cache key includes effective source, revision, offline/trust policy, cache directory, resolved device, resolved precision, and concurrency. Loading is lazy and concurrency-safe; no model is loaded by startup, `/health`, or `/models`. GPU inference defaults to one concurrent call to avoid overlapping roughly 444 MB of weights plus provisional multi-GB 2048px activation/working memory. Actual VRAM and image quality are not guaranteed until evaluated on the target GPU; lower `BIREFNET_INFERENCE_SIZE` if memory is constrained.
+
+BiRefNet model loading, preprocessing, bounded-concurrency waiting, inference, postprocessing, and PNG encoding run in worker threads rather than on the FastAPI event loop. If a client disconnects or its request task is cancelled, response waiting stops promptly. Python cannot force-cancel an already-running CUDA kernel, so that worker safely finishes in the background and releases the backend semaphore before its references are discarded.
 
 ```bash
 curl -sS -X POST \

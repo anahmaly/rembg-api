@@ -3,8 +3,8 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from collections import OrderedDict
 from dataclasses import dataclass
-from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 from typing import Literal, Protocol
@@ -253,21 +253,22 @@ class BiRefNetBackend:
         return output.getvalue()
 
 
-_cache_lock = threading.RLock()
-_loaded_keys: set[tuple[object, ...]] = set()
+BackendKey = tuple[
+    str, str, bool, bool, str | None, ResolvedDevice, ResolvedPrecision, int
+]
 
 
-@lru_cache(maxsize=8)
-def _cached_backend(
-    source: str,
-    revision: str,
-    local_files_only: bool,
-    trust_remote_code: bool,
-    cache_dir: str | None,
-    device: ResolvedDevice,
-    precision: ResolvedPrecision,
-    max_concurrency: int,
-) -> BiRefNetBackend:
+def _load_backend(key: BackendKey) -> BiRefNetBackend:
+    (
+        source,
+        revision,
+        local_files_only,
+        trust_remote_code,
+        cache_dir,
+        device,
+        precision,
+        max_concurrency,
+    ) = key
     config = BiRefNetConfig(
         source,
         revision,
@@ -280,41 +281,88 @@ def _cached_backend(
         False,
         max_concurrency,
     )
-    backend = BiRefNetBackend(config, device, precision)
-    _loaded_keys.add(
-        (
-            source,
-            revision,
-            local_files_only,
-            trust_remote_code,
-            cache_dir,
-            device,
-            precision,
-            max_concurrency,
-        )
+    return BiRefNetBackend(config, device, precision)
+
+
+class BackendCache:
+    """Thread-safe bounded LRU cache with atomic lazy construction per key."""
+
+    def __init__(self, maxsize: int = 8) -> None:
+        self.maxsize = maxsize
+        self._lock = threading.RLock()
+        self._entries: OrderedDict[BackendKey, BiRefNetBackend] = OrderedDict()
+        self._loading: dict[BackendKey, threading.Event] = {}
+        self._generation = 0
+
+    def get(self, key: BackendKey) -> BiRefNetBackend:
+        while True:
+            with self._lock:
+                backend = self._entries.get(key)
+                if backend is not None:
+                    self._entries.move_to_end(key)
+                    return backend
+                ready = self._loading.get(key)
+                if ready is None:
+                    ready = self._loading[key] = threading.Event()
+                    generation = self._generation
+                    break
+            ready.wait()
+
+        try:
+            backend = _load_backend(key)
+        except BaseException:
+            with self._lock:
+                self._loading.pop(key).set()
+            raise
+
+        with self._lock:
+            # A clear racing a load drops the cache reference, but the requesting
+            # worker can still safely use the backend it just constructed.
+            if generation == self._generation:
+                self._entries[key] = backend
+                if len(self._entries) > self.maxsize:
+                    # In-flight calls retain their own reference until inference and
+                    # semaphore release finish; eviction only drops the cache reference.
+                    self._entries.popitem(last=False)
+            self._loading.pop(key).set()
+        return backend
+
+    def contains(self, key: BackendKey) -> bool:
+        with self._lock:
+            return key in self._entries
+
+    def clear(self) -> int:
+        with self._lock:
+            count = len(self._entries)
+            self._entries.clear()
+            self._generation += 1
+            return count
+
+
+_backend_cache = BackendCache(maxsize=8)
+
+
+def _cache_key(config: BiRefNetConfig) -> BackendKey:
+    device, precision = resolve_runtime(config.device, config.precision)
+    return (
+        config.source,
+        config.revision,
+        config.local_files_only,
+        config.trust_remote_code,
+        config.cache_dir,
+        device,
+        precision,
+        config.max_concurrency,
     )
-    return backend
 
 
 def get_backend(config: BiRefNetConfig) -> BiRefNetBackend:
-    device, precision = resolve_runtime(config.device, config.precision)
-    with _cache_lock:
-        return _cached_backend(
-            config.source,
-            config.revision,
-            config.local_files_only,
-            config.trust_remote_code,
-            config.cache_dir,
-            device,
-            precision,
-            config.max_concurrency,
-        )
+    return _backend_cache.get(_cache_key(config))
 
 
-def clear_cache() -> None:
-    with _cache_lock:
-        _cached_backend.cache_clear()
-        _loaded_keys.clear()
+def clear_cache() -> int:
+    """Drop cached references while allowing active calls to finish safely."""
+    return _backend_cache.clear()
 
 
 def remove_with_birefnet(
@@ -366,7 +414,7 @@ def health_info(config: BiRefNetConfig | None = None) -> dict[str, object]:
             "local_files_only": config.local_files_only,
             "trust_remote_code": config.trust_remote_code,
             "model_mount_available": mounted,
-            "loaded": key in _loaded_keys,
+            "loaded": _backend_cache.contains(key),
             "ready": (bool(mounted) and config.trust_remote_code)
             if config.local_files_only
             else config.trust_remote_code,

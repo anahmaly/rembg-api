@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 from io import BytesIO
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -290,3 +292,108 @@ def test_lazy_cache_loads_once(tmp_path, monkeypatch):
     assert birefnet_hr.get_backend(cfg) is fake
     assert birefnet_hr.get_backend(cfg) is fake
     assert len(calls) == 1
+
+
+def test_cache_eviction_and_health_share_one_source_of_truth(tmp_path, monkeypatch):
+    monkeypatch.setattr(birefnet_hr, "resolve_runtime", lambda *args: ("cpu", "fp32"))
+    monkeypatch.setattr(birefnet_hr, "BiRefNetBackend", lambda *args: object())
+    birefnet_hr.clear_cache()
+    configs = []
+    for index in range(9):
+        source = tmp_path / str(index)
+        source.mkdir()
+        cfg = config(source)
+        configs.append(cfg)
+        birefnet_hr.get_backend(cfg)
+    assert health_info(configs[0])["loaded"] is False
+    assert all(health_info(cfg)["loaded"] is True for cfg in configs[1:])
+
+
+def test_concurrent_duplicate_cache_key_loads_once(tmp_path, monkeypatch):
+    calls = 0
+    start = threading.Barrier(5)
+
+    def load(*args):
+        nonlocal calls
+        calls += 1
+        time.sleep(0.02)
+        return object()
+
+    monkeypatch.setattr(birefnet_hr, "resolve_runtime", lambda *args: ("cpu", "fp32"))
+    monkeypatch.setattr(birefnet_hr, "BiRefNetBackend", load)
+    birefnet_hr.clear_cache()
+    cfg = config(tmp_path)
+    results = []
+
+    def get():
+        start.wait()
+        results.append(birefnet_hr.get_backend(cfg))
+
+    threads = [threading.Thread(target=get) for _ in range(5)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert calls == 1
+    assert len({id(result) for result in results}) == 1
+
+
+def test_slow_birefnet_does_not_block_health_and_cancellation_releases_worker(
+    monkeypatch,
+):
+    entered = threading.Event()
+    release = threading.Event()
+    semaphore = threading.BoundedSemaphore(1)
+    active = 0
+    lock = threading.Lock()
+
+    def slow_remove(data, **kwargs):
+        nonlocal active
+        with semaphore:
+            with lock:
+                active += 1
+            entered.set()
+            release.wait(timeout=2)
+            with lock:
+                active -= 1
+            return make_png()
+
+    monkeypatch.setattr(main, "remove_with_birefnet", slow_remove)
+    monkeypatch.setattr(main, "get_onnxruntime_provider_info", lambda: {})
+    monkeypatch.setattr(main, "get_bria_model_info", lambda: {})
+    monkeypatch.setattr(main, "birefnet_health_info", lambda: {"loaded": True})
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            request = asyncio.create_task(
+                client.post(
+                    "/remove-background/?model=birefnet-hr-matting",
+                    files={"file": ("in.png", make_png(), "image/png")},
+                )
+            )
+            assert await asyncio.to_thread(entered.wait, 1)
+            health = await asyncio.wait_for(client.get("/health"), timeout=0.25)
+            assert health.status_code == 200
+            request.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await request
+            release.set()
+            for _ in range(100):
+                with lock:
+                    if active == 0:
+                        break
+                await asyncio.sleep(0.01)
+            assert active == 0
+            second = await asyncio.wait_for(
+                client.post(
+                    "/remove-background/?model=birefnet-hr-matting",
+                    files={"file": ("in.png", make_png(), "image/png")},
+                ),
+                timeout=1,
+            )
+            assert second.status_code == 200
+
+    asyncio.run(scenario())
