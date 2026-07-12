@@ -39,6 +39,7 @@ from rembg_api.image_processing import AlphaOptions, DespillOptions, process_png
 from rembg_api.limits import (
     ImageLimitError,
     input_limits_from_env,
+    max_request_bytes_from_env,
     max_upload_bytes_from_env,
     output_limits_from_env,
     validate_image_bytes,
@@ -104,6 +105,21 @@ async def _read_upload_limited(file: UploadFile, max_bytes: int) -> bytes:
     if not chunks:
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
     return b"".join(chunks)
+
+
+def _reject_invalid_or_oversized_declared_request(
+    request: Request, max_bytes: int
+) -> None:
+    """Reject unusable or excessive request lengths before application upload reads."""
+    content_length = request.headers.get("content-length")
+    if content_length is None:
+        return
+    if not content_length.isdecimal():
+        raise HTTPException(status_code=400, detail="Invalid Content-Length header")
+    if int(content_length) > max_bytes:
+        raise HTTPException(
+            status_code=413, detail="Request body is larger than this service accepts"
+        )
 
 
 def _consume_background_task_result(task: asyncio.Task[bytes]) -> None:
@@ -215,8 +231,8 @@ def clear_caches(
     response_class=Response,
     responses={
         200: {"content": {"image/png": {}}},
-        400: {"description": "Invalid request"},
-        413: {"description": "Image or upload exceeds service limits"},
+        400: {"description": "Invalid request or Content-Length header"},
+        413: {"description": "HTTP request body, image, or upload exceeds service limits"},
         429: {"description": "BiRefNet capacity is currently unavailable"},
         500: {"description": "Internal processing error"},
     },
@@ -307,9 +323,11 @@ async def remove_background(
         )
 
     max_upload_bytes = max_upload_bytes_from_env()
-    # Content-Length covers the multipart envelope as well as file bytes, so it
-    # cannot safely enforce a per-file limit. _read_upload_limited applies the
-    # exact limit while streaming the selected upload.
+    max_request_bytes = max_request_bytes_from_env()
+    # Content-Length covers the multipart envelope as well as file bytes. It is
+    # checked only against the separate whole-request bound; _read_upload_limited
+    # continues to enforce the exact per-file bound while streaming the upload.
+    _reject_invalid_or_oversized_declared_request(request, max_request_bytes)
     input_limits = input_limits_from_env()
     output_limits = output_limits_from_env()
     bria_request = model == BRIA_RMBG_2_MODEL_ID

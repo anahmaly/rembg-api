@@ -247,10 +247,11 @@ If both `return_alpha` and `return_checker_preview` are true, `return_alpha` tak
 
 ## Request and image limits
 
-The service applies these process-wide bounds to every `/remove-background/` request. They preserve normal rembg-compatible images within the configured limits and reject invalid or oversized work before costly decode, tensor, or RGBA allocations. A declared multipart `Content-Length` over `REMBG_MAX_UPLOAD_BYTES` is rejected immediately; uploads without a usable length are read in 64 KiB chunks and stop at the same byte limit. Image headers are checked before RGB conversion, and output dimensions are checked before BiRefNet alpha resizing/RGBA allocation and again before postprocessing. Final encoded PNG bytes are also bounded.
+The service applies these process-wide bounds to every `/remove-background/` request. They preserve normal rembg-compatible images within the configured limits and reject invalid or oversized work before costly decode, tensor, or RGBA allocations. A declared multipart `Content-Length` over `REMBG_MAX_REQUEST_BYTES` is rejected immediately before application code reads the `UploadFile`; malformed or negative declared lengths return `400`. This is deliberately separate from `REMBG_MAX_UPLOAD_BYTES`: multipart framing means total request bytes are not the same as the selected file's bytes. The selected file is always read in 64 KiB chunks and stops at the exact file limit, including when `Content-Length` is absent. Image headers are checked before RGB conversion, and output dimensions are checked before BiRefNet alpha resizing/RGBA allocation and again before postprocessing. Final encoded PNG bytes are also bounded.
 
 | Variable | Default | Scope |
 | --- | --- | --- |
+| `REMBG_MAX_REQUEST_BYTES` | `21000000` | Whole HTTP request body, including multipart framing. Must be at least `REMBG_MAX_UPLOAD_BYTES`; the default leaves 1 MB for normal multipart overhead. |
 | `REMBG_MAX_UPLOAD_BYTES` | `20000000` | Input file bytes read from multipart upload. |
 | `REMBG_MAX_INPUT_WIDTH` | `10000` | Decoded source-image width. |
 | `REMBG_MAX_INPUT_HEIGHT` | `10000` | Decoded source-image height. |

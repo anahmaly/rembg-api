@@ -5,13 +5,26 @@ from io import BytesIO
 import pytest
 from PIL import Image
 
-from rembg_api.limits import ImageLimitError, ImageLimits, validate_image_bytes
+from rembg_api.limits import (
+    ImageLimitError,
+    ImageLimits,
+    max_request_bytes_from_env,
+    validate_image_bytes,
+)
 
 
 def png_bytes(size: tuple[int, int] = (2, 2)) -> bytes:
     output = BytesIO()
     Image.new("RGB", size).save(output, "PNG")
     return output.getvalue()
+
+
+def test_request_byte_limit_must_allow_file_limit(monkeypatch) -> None:
+    monkeypatch.setenv("REMBG_MAX_UPLOAD_BYTES", "20")
+    monkeypatch.setenv("REMBG_MAX_REQUEST_BYTES", "19")
+
+    with pytest.raises(ValueError, match="REMBG_MAX_REQUEST_BYTES"):
+        max_request_bytes_from_env()
 
 
 def test_decoded_pixel_limit_allows_exact_edge() -> None:

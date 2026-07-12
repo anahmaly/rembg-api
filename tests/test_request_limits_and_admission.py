@@ -32,6 +32,30 @@ def test_multipart_content_length_over_file_limit_does_not_reject_near_limit_fil
     assert response.status_code == 200
 
 
+def test_oversized_declared_request_length_rejects_before_upload_read(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        main, "max_request_bytes_from_env", lambda: 100, raising=False
+    )
+
+    async def fail_if_read(*args: object, **kwargs: object) -> bytes:
+        raise AssertionError("oversized declared request must not read the upload")
+
+    monkeypatch.setattr(main, "_read_upload_limited", fail_if_read)
+
+    from fastapi.testclient import TestClient
+
+    response = TestClient(main.app).post(
+        "/remove-background/?model=u2net",
+        files={"file": ("in.png", make_png(), "image/png")},
+        headers={"Content-Length": "101"},
+    )
+
+    assert response.status_code == 413
+    assert response.json()["detail"] == "Request body is larger than this service accepts"
+
+
 def test_oversized_multipart_upload_returns_413_at_route_level(monkeypatch) -> None:
     monkeypatch.setattr(main, "max_upload_bytes_from_env", lambda: 10)
 

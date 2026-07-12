@@ -62,6 +62,17 @@ def max_upload_bytes_from_env() -> int:
     return _positive_int_env("REMBG_MAX_UPLOAD_BYTES", 20_000_000)
 
 
+def max_request_bytes_from_env() -> int:
+    """Return the whole HTTP body limit, including multipart framing."""
+    max_upload_bytes = max_upload_bytes_from_env()
+    max_request_bytes = _positive_int_env("REMBG_MAX_REQUEST_BYTES", 21_000_000)
+    if max_request_bytes < max_upload_bytes:
+        raise ValueError(
+            "REMBG_MAX_REQUEST_BYTES must be at least REMBG_MAX_UPLOAD_BYTES"
+        )
+    return max_request_bytes
+
+
 def validate_image_bytes(data: bytes, limits: ImageLimits, *, subject: str) -> tuple[int, int]:
     """Read only image headers and reject decompression bombs before pixel allocation."""
     try:
