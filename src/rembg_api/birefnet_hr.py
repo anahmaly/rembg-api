@@ -193,6 +193,7 @@ class BiRefNetBackend:
         foreground_refinement: bool,
         input_limits: ImageLimits | None = None,
         output_limits: ImageLimits | None = None,
+        validated_input_dimensions: tuple[int, int] | None = None,
     ) -> bytes:
         import torch
         from torchvision.transforms.functional import (
@@ -204,7 +205,12 @@ class BiRefNetBackend:
 
         input_limits = input_limits or input_limits_from_env()
         output_limits = output_limits or output_limits_from_env()
-        validate_image_bytes(data, input_limits, subject="upload")
+        if validated_input_dimensions is None:
+            validate_image_bytes(data, input_limits, subject="upload")
+        else:
+            input_limits.validate_dimensions(
+                *validated_input_dimensions, subject="upload"
+            )
         try:
             with Image.open(BytesIO(data)) as opened:
                 # Check dimensions immediately after header parsing, before RGB
@@ -407,12 +413,17 @@ def remove_with_birefnet(
         if foreground_refinement is None
         else foreground_refinement
     )
+    input_limits = input_limits or input_limits_from_env()
+    validated_input_dimensions = validate_image_bytes(
+        data, input_limits, subject="upload"
+    )
     return get_backend(config).remove_background(
         data,
         inference_size=size,
         foreground_refinement=refinement,
         input_limits=input_limits,
         output_limits=output_limits,
+        validated_input_dimensions=validated_input_dimensions,
     )
 
 

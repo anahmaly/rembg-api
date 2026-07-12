@@ -2,21 +2,115 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from io import BytesIO
 
 import httpx
 import pytest
+from PIL import Image
 
-from rembg_api import main
+from rembg_api import birefnet_hr, main
 from rembg_api.birefnet_hr import BiRefNetConfig, DEFAULT_REVISION
 from rembg_api.limits import ImageLimits
 from helpers import make_png
 
 
-def test_upload_content_length_is_rejected_before_read() -> None:
-    request = type("Request", (), {"headers": {"content-length": "11"}})()
-    with pytest.raises(Exception) as caught:
-        main._reject_oversized_content_length(request, 10)
-    assert caught.value.status_code == 413
+def test_multipart_content_length_over_file_limit_does_not_reject_near_limit_file(
+    monkeypatch,
+) -> None:
+    payload = make_png()
+    monkeypatch.setattr(main, "max_upload_bytes_from_env", lambda: len(payload))
+    monkeypatch.setattr(main, "remove", lambda *args, **kwargs: make_png())
+    monkeypatch.setattr(main, "new_session", lambda model: object())
+
+    from fastapi.testclient import TestClient
+
+    response = TestClient(main.app).post(
+        "/remove-background/?model=u2net",
+        files={"file": ("in.png", payload, "image/png")},
+    )
+
+    assert response.status_code == 200
+
+
+def test_oversized_multipart_upload_returns_413_at_route_level(monkeypatch) -> None:
+    monkeypatch.setattr(main, "max_upload_bytes_from_env", lambda: 10)
+
+    from fastapi.testclient import TestClient
+
+    response = TestClient(main.app).post(
+        "/remove-background/?model=u2net",
+        files={"file": ("in.png", b"x" * 11, "image/png")},
+    )
+
+    assert response.status_code == 413
+
+
+def test_birefnet_oversized_headers_return_413_before_backend_load(monkeypatch) -> None:
+    output = BytesIO()
+    Image.new("RGB", (10_001, 1)).save(output, "PNG")
+    payload = output.getvalue()
+    assert len(payload) < 1_000
+    config = BiRefNetConfig(
+        source="/models/test",
+        revision=DEFAULT_REVISION,
+        local_files_only=True,
+        trust_remote_code=True,
+        cache_dir=None,
+        device="cpu",
+        precision="fp32",
+        inference_size=512,
+        foreground_refinement=False,
+        max_concurrency=1,
+    )
+    calls = 0
+    main._birefnet_admissions.clear()
+    monkeypatch.setattr(main.BiRefNetConfig, "from_env", lambda: config)
+    monkeypatch.setattr(main, "input_limits_from_env", lambda: ImageLimits(10_000, 10_000, 40_000_000))
+
+    def fail_if_loaded(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("BiRefNet backend must not load for rejected headers")
+
+    monkeypatch.setattr(birefnet_hr, "get_backend", fail_if_loaded)
+
+    from fastapi.testclient import TestClient
+
+    response = TestClient(main.app).post(
+        "/remove-background/?model=birefnet-hr-matting",
+        files={"file": ("oversized.png", bytes(payload), "image/png")},
+    )
+
+    assert response.status_code == 413
+    assert calls == 0
+
+
+def test_birefnet_decompression_bomb_returns_413_before_backend_load(monkeypatch) -> None:
+    config = BiRefNetConfig(
+        source="/models/test",
+        revision=DEFAULT_REVISION,
+        local_files_only=True,
+        trust_remote_code=True,
+        cache_dir=None,
+        device="cpu",
+        precision="fp32",
+        inference_size=512,
+        foreground_refinement=False,
+        max_concurrency=1,
+    )
+    main._birefnet_admissions.clear()
+    monkeypatch.setattr(main.BiRefNetConfig, "from_env", lambda: config)
+    monkeypatch.setattr(birefnet_hr, "get_backend", lambda *args: pytest.fail("backend loaded"))
+    monkeypatch.setattr("PIL.Image.MAX_IMAGE_PIXELS", 1)
+
+    from fastapi.testclient import TestClient
+
+    response = TestClient(main.app).post(
+        "/remove-background/?model=birefnet-hr-matting",
+        files={"file": ("bomb.png", make_png(), "image/png")},
+    )
+
+    assert response.status_code == 413
 
 
 def test_lazy_chunked_upload_is_rejected_at_actual_byte_limit() -> None:

@@ -106,19 +106,6 @@ async def _read_upload_limited(file: UploadFile, max_bytes: int) -> bytes:
     return b"".join(chunks)
 
 
-def _reject_oversized_content_length(request: Request, max_bytes: int) -> None:
-    content_length = request.headers.get("content-length")
-    if content_length is None:
-        return
-    try:
-        if int(content_length) > max_bytes:
-            raise HTTPException(
-                status_code=413, detail="Uploaded image is larger than this service accepts"
-            )
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid Content-Length header") from None
-
-
 def _consume_background_task_result(task: asyncio.Task[bytes]) -> None:
     try:
         task.result()
@@ -320,7 +307,9 @@ async def remove_background(
         )
 
     max_upload_bytes = max_upload_bytes_from_env()
-    _reject_oversized_content_length(request, max_upload_bytes)
+    # Content-Length covers the multipart envelope as well as file bytes, so it
+    # cannot safely enforce a per-file limit. _read_upload_limited applies the
+    # exact limit while streaming the selected upload.
     input_limits = input_limits_from_env()
     output_limits = output_limits_from_env()
     bria_request = model == BRIA_RMBG_2_MODEL_ID
